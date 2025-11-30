@@ -8,6 +8,7 @@ RGB-Dカメラからの点群データを使用して、RANSAC + 法線ベクト
 - **法線ベクトル制約**: 重力方向（TFから取得）と平行な平面のみを検出
 - **高さベース分類**: 床面 / テーブル / 棚 を高さで自動分類
 - **リアルタイム可視化**: RViz2でのMarkerArray表示 + RGB画像へのオーバーレイ
+- **MP4録画機能**: 平面検出結果をMP4動画として保存
 
 ## 依存パッケージ
 
@@ -63,6 +64,64 @@ ros2 run plane_detector plane_detector_node --ros-args \
     -p use_sim_time:=true \
     -p depth_scale:=1000.0
 ```
+
+### MP4録画（plane_recorder_node）
+
+平面検出結果をMP4動画として保存する機能です。RGB画像へのオーバーレイと深度画像を並べて録画します。
+
+```bash
+# ターミナル1: rosbagを再生
+ros2 bag play /home/ryo/workspace/koike_robo_sandbox/datasets/robocup/storing_try_2/ --clock --loop
+
+# ターミナル2: 録画ノードを起動（出力パス指定）
+ros2 run plane_detector plane_recorder_node --ros-args \
+    -p use_sim_time:=true \
+    -p output_path:=/path/to/output.mp4
+
+# 出力パスを指定しない場合は自動生成（plane_detection_YYYYMMDD_HHMMSS.mp4）
+ros2 run plane_detector plane_recorder_node --ros-args \
+    -p use_sim_time:=true
+
+# 無差別に全平面を検出（水平フィルタなし）
+ros2 run plane_detector plane_recorder_node --ros-args \
+    -p use_sim_time:=true \
+    -p filter_horizontal:=false \
+    -p max_planes:=10 \
+    -p output_path:=/tmp/all_planes.mp4
+
+# 水平平面のみをフィルタして録画
+ros2 run plane_detector plane_recorder_node --ros-args \
+    -p use_sim_time:=true \
+    -p filter_horizontal:=true \
+    -p normal_threshold_deg:=15.0 \
+    -p output_path:=/tmp/horizontal_planes.mp4
+```
+
+#### 録画ノードのパラメータ
+
+| パラメータ | デフォルト | 説明 |
+|-----------|----------|------|
+| `output_path` | 自動生成 | 出力MP4ファイルのパス |
+| `output_fps` | 10.0 | 出力動画のFPS |
+| `filter_horizontal` | false | trueで水平平面のみ検出 |
+| `normal_threshold_deg` | 45.0 | 水平フィルタ時の許容角度（度） |
+| `max_planes` | 10 | 検出する最大平面数 |
+| `process_rate` | 10.0 | 処理レート (Hz) |
+| `show_window` | true | 録画中にプレビュー表示 |
+| `layout` | horizontal | 出力レイアウト（horizontal/vertical） |
+
+#### 操作方法
+
+- **Q キー**: 録画を終了して保存
+- **Ctrl+C**: 録画を終了して保存
+
+#### 出力形式
+
+録画される動画は以下の構成です：
+- **左側**: RGB画像に検出した平面をカラーオーバーレイ
+- **右側**: 深度画像（VIRIDISカラーマップ）に平面をオーバーレイ
+
+各平面は異なる色で表示され、画面上部にプレーンID、点数、高さ情報が表示されます。
 
 ## Launch引数
 
