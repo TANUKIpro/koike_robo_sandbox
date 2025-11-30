@@ -106,6 +106,13 @@ class ParameterPanel(ttk.Frame):
             "Enable Normal Filter", self.enable_normal_filter_var, row
         )
 
+        # Plane orientation selector
+        self.plane_orientation_var = tk.StringVar(value=self.params.plane_orientation)
+        row = self._add_combobox(
+            "Plane Orientation", self.plane_orientation_var,
+            ["horizontal", "vertical", "any"], row
+        )
+
         self.normal_threshold_deg_var = tk.DoubleVar(value=self.params.normal_threshold_deg)
         row = self._add_slider(
             "Normal Threshold (deg)", self.normal_threshold_deg_var,
@@ -289,6 +296,7 @@ class ParameterPanel(ttk.Frame):
             max_planes=int(self.max_planes_var.get()),
             normal_threshold_deg=self.normal_threshold_deg_var.get(),
             enable_normal_filter=self.enable_normal_filter_var.get(),
+            plane_orientation=self.plane_orientation_var.get(),
             downsample_factor=int(self.downsample_factor_var.get()),
             min_depth=self.min_depth_var.get(),
             max_depth=self.max_depth_var.get(),
@@ -313,6 +321,7 @@ class ParameterPanel(ttk.Frame):
         self.max_planes_var.set(params.max_planes)
         self.normal_threshold_deg_var.set(params.normal_threshold_deg)
         self.enable_normal_filter_var.set(params.enable_normal_filter)
+        self.plane_orientation_var.set(params.plane_orientation)
         self.downsample_factor_var.set(params.downsample_factor)
         self.min_depth_var.set(params.min_depth)
         self.max_depth_var.set(params.max_depth)

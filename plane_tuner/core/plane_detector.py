@@ -35,9 +35,10 @@ class PlaneDetectionParams:
     min_plane_area: float = 0.05  # Minimum area (m^2)
     max_planes: int = 8  # Maximum planes to detect
 
-    # Normal constraint (for horizontal plane detection)
-    normal_threshold_deg: float = 15.0  # Max angle from vertical (degrees)
+    # Normal constraint (for plane orientation detection)
+    normal_threshold_deg: float = 15.0  # Max angle deviation (degrees)
     enable_normal_filter: bool = True  # Filter by normal direction
+    plane_orientation: str = "horizontal"  # "horizontal", "vertical", or "any"
 
     # Pre-processing
     downsample_factor: int = 4  # Point cloud downsampling
@@ -449,11 +450,25 @@ class PlaneDetector:
             normal = -normal
             d = -d
 
-        # Check normal constraint
+        # Check normal constraint based on plane orientation
         if self.params.enable_normal_filter:
-            angle = np.arccos(np.clip(np.dot(normal, self._gravity_direction), -1.0, 1.0))
-            if angle > self.params.normal_threshold_rad:
-                return None
+            # Calculate angle between normal and gravity direction
+            dot_product = np.dot(normal, self._gravity_direction)
+            angle_from_gravity = np.arccos(np.clip(abs(dot_product), 0.0, 1.0))
+
+            orientation = self.params.plane_orientation.lower()
+            threshold = self.params.normal_threshold_rad
+
+            if orientation == "horizontal":
+                # Horizontal planes: normal parallel to gravity (angle ~0)
+                if angle_from_gravity > threshold:
+                    return None
+            elif orientation == "vertical":
+                # Vertical planes: normal perpendicular to gravity (angle ~90°)
+                angle_from_horizontal = abs(np.pi / 2 - angle_from_gravity)
+                if angle_from_horizontal > threshold:
+                    return None
+            # "any" - no filtering
 
         # Get plane points
         plane_points = points[inlier_indices]

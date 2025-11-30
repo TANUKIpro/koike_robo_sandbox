@@ -453,6 +453,7 @@ class MainWindow:
             'max_planes': params.max_planes,
             'normal_threshold_deg': params.normal_threshold_deg,
             'enable_normal_filter': params.enable_normal_filter,
+            'plane_orientation': params.plane_orientation,
             'downsample_factor': params.downsample_factor,
             'min_depth': params.min_depth,
             'max_depth': params.max_depth,
