@@ -2,16 +2,23 @@
 Image and rosbag loading utilities for plane_tuner.
 Supports:
 - Direct RGB + Depth image file pairs
-- ROS2 rosbag extraction
+- ROS2 rosbag extraction (using rosbags library - no ROS2 required)
 - TUM RGB-D dataset format
+- RoboCup dataset (TIAGo rosbag)
 """
 
 import cv2
 import numpy as np
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict, Any
 import struct
+
+
+# Default RoboCup/TIAGo topics
+TIAGO_RGB_TOPIC = "/head_front_camera/rgb/image_raw"
+TIAGO_DEPTH_TOPIC = "/head_front_camera/depth/image_raw"
+TIAGO_CAMERA_INFO_TOPIC = "/head_front_camera/rgb/camera_info"
 
 
 @dataclass
@@ -60,13 +67,32 @@ class CameraIntrinsics:
 
     @classmethod
     def from_tiago(cls) -> 'CameraIntrinsics':
-        """TIAGo robot camera parameters (typical)."""
-        return cls(fx=554.25, fy=554.25, cx=320.5, cy=240.5, depth_scale=1000.0)
+        """TIAGo robot camera parameters (Orbbec Astra Pro)."""
+        return cls(fx=570.3, fy=570.3, cx=319.5, cy=239.5, depth_scale=1000.0)
+
+    @classmethod
+    def from_robocup_tiago(cls) -> 'CameraIntrinsics':
+        """RoboCup 2023-2024 TIAGo dataset camera parameters."""
+        return cls(fx=570.3, fy=570.3, cx=319.5, cy=239.5, depth_scale=1000.0)
 
     @classmethod
     def from_realsense_d435(cls) -> 'CameraIntrinsics':
         """Intel RealSense D435 (typical 640x480)."""
         return cls(fx=615.0, fy=615.0, cx=320.0, cy=240.0, depth_scale=1000.0)
+
+    @classmethod
+    def from_camera_info(cls, camera_info: Dict[str, Any]) -> 'CameraIntrinsics':
+        """Create from ROS CameraInfo message data."""
+        k = camera_info.get('k', camera_info.get('K', [525, 0, 319.5, 0, 525, 239.5, 0, 0, 1]))
+        return cls(
+            fx=k[0],
+            fy=k[4],
+            cx=k[2],
+            cy=k[5],
+            width=camera_info.get('width', 640),
+            height=camera_info.get('height', 480),
+            depth_scale=1000.0  # Default for TIAGo
+        )
 
 
 class ImageLoader:
@@ -265,142 +291,234 @@ class ImageLoader:
 
         return assoc_path
 
+    def load_rosbag_sequence(
+        self,
+        bag_path: str,
+        rgb_topic: str = TIAGO_RGB_TOPIC,
+        depth_topic: str = TIAGO_DEPTH_TOPIC,
+        camera_info_topic: str = TIAGO_CAMERA_INFO_TOPIC,
+        max_frames: int = 100,
+        skip_frames: int = 0
+    ) -> int:
+        """
+        Load multiple frames from ROS2 rosbag.
+
+        Uses rosbags library (no ROS2 installation required).
+
+        Args:
+            bag_path: Path to rosbag directory or file
+            rgb_topic: RGB image topic name
+            depth_topic: Depth image topic name
+            camera_info_topic: Camera info topic name
+            max_frames: Maximum frames to load
+            skip_frames: Skip first N frames
+
+        Returns:
+            Number of frames loaded
+        """
+        try:
+            return self._load_rosbag_sequence_rosbags(
+                bag_path, rgb_topic, depth_topic, camera_info_topic, max_frames, skip_frames
+            )
+        except ImportError as e:
+            print(f"rosbags library not available: {e}")
+            print("Install with: pip install rosbags")
+            return 0
+
+    def _load_rosbag_sequence_rosbags(
+        self,
+        bag_path: str,
+        rgb_topic: str,
+        depth_topic: str,
+        camera_info_topic: str,
+        max_frames: int,
+        skip_frames: int
+    ) -> int:
+        """Load rosbag using rosbags library (no ROS2 required)."""
+        from rosbags.rosbag2 import Reader
+        from rosbags.serde import deserialize_cdr
+
+        bag_path = Path(bag_path)
+
+        # Collect RGB and depth messages by timestamp
+        rgb_messages: Dict[int, Any] = {}
+        depth_messages: Dict[int, Any] = {}
+        camera_info = None
+
+        print(f"Reading rosbag from: {bag_path}")
+
+        with Reader(bag_path) as reader:
+            # Print available topics
+            print("Available topics:")
+            for conn in reader.connections:
+                print(f"  {conn.topic}: {conn.msgtype}")
+
+            for connection, timestamp, rawdata in reader.messages():
+                topic = connection.topic
+
+                if topic == camera_info_topic and camera_info is None:
+                    msg = deserialize_cdr(rawdata, connection.msgtype)
+                    camera_info = {
+                        'k': list(msg.k),
+                        'width': msg.width,
+                        'height': msg.height
+                    }
+                    self.intrinsics = CameraIntrinsics.from_camera_info(camera_info)
+                    print(f"Camera intrinsics loaded: fx={self.intrinsics.fx:.1f}, fy={self.intrinsics.fy:.1f}")
+
+                elif topic == rgb_topic:
+                    rgb_messages[timestamp] = (rawdata, connection.msgtype)
+
+                elif topic == depth_topic:
+                    depth_messages[timestamp] = (rawdata, connection.msgtype)
+
+        # Match RGB and depth by timestamp
+        print(f"Found {len(rgb_messages)} RGB and {len(depth_messages)} depth messages")
+
+        self._frames = []
+        rgb_timestamps = sorted(rgb_messages.keys())
+
+        frame_count = 0
+        for rgb_ts in rgb_timestamps:
+            if frame_count < skip_frames:
+                frame_count += 1
+                continue
+
+            if len(self._frames) >= max_frames:
+                break
+
+            # Find closest depth timestamp
+            best_depth_ts = None
+            best_diff = float('inf')
+            for depth_ts in depth_messages:
+                diff = abs(rgb_ts - depth_ts)
+                if diff < best_diff:
+                    best_diff = diff
+                    best_depth_ts = depth_ts
+
+            # Allow up to 100ms difference
+            if best_depth_ts is None or best_diff > 100_000_000:  # 100ms in nanoseconds
+                frame_count += 1
+                continue
+
+            # Deserialize messages
+            rgb_raw, rgb_msgtype = rgb_messages[rgb_ts]
+            depth_raw, depth_msgtype = depth_messages[best_depth_ts]
+
+            rgb_msg = deserialize_cdr(rgb_raw, rgb_msgtype)
+            depth_msg = deserialize_cdr(depth_raw, depth_msgtype)
+
+            # Convert RGB
+            rgb = self._convert_ros_image(rgb_msg)
+            if rgb is None:
+                frame_count += 1
+                continue
+
+            # Convert Depth
+            depth = self._convert_ros_depth(depth_msg)
+            if depth is None:
+                frame_count += 1
+                continue
+
+            frame = RGBDFrame(
+                rgb=rgb,
+                depth=depth,
+                timestamp=rgb_ts / 1e9,
+                rgb_path=f"rosbag:{rgb_ts}",
+                depth_path=f"rosbag:{best_depth_ts}"
+            )
+            self._frames.append(frame)
+            frame_count += 1
+
+        self._current_index = 0
+        print(f"Loaded {len(self._frames)} RGB-D frames from rosbag")
+        return len(self._frames)
+
+    def _convert_ros_image(self, msg) -> Optional[np.ndarray]:
+        """Convert ROS Image message to numpy array."""
+        try:
+            if msg.encoding in ['rgb8']:
+                rgb = np.frombuffer(bytes(msg.data), dtype=np.uint8)
+                rgb = rgb.reshape((msg.height, msg.width, 3))
+                return rgb
+            elif msg.encoding in ['bgr8']:
+                bgr = np.frombuffer(bytes(msg.data), dtype=np.uint8)
+                bgr = bgr.reshape((msg.height, msg.width, 3))
+                return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            else:
+                print(f"Unsupported RGB encoding: {msg.encoding}")
+                return None
+        except Exception as e:
+            print(f"Error converting RGB image: {e}")
+            return None
+
+    def _convert_ros_depth(self, msg) -> Optional[np.ndarray]:
+        """Convert ROS depth Image message to numpy array (in meters)."""
+        try:
+            if msg.encoding == '16UC1':
+                depth = np.frombuffer(bytes(msg.data), dtype=np.uint16)
+                depth = depth.reshape((msg.height, msg.width))
+                depth_m = depth.astype(np.float32) / self.intrinsics.depth_scale
+            elif msg.encoding == '32FC1':
+                depth_m = np.frombuffer(bytes(msg.data), dtype=np.float32)
+                depth_m = depth_m.reshape((msg.height, msg.width))
+            else:
+                print(f"Unsupported depth encoding: {msg.encoding}")
+                return None
+
+            # Handle invalid values
+            depth_m[depth_m <= 0] = 0
+            depth_m[np.isnan(depth_m)] = 0
+            depth_m[np.isinf(depth_m)] = 0
+
+            return depth_m
+        except Exception as e:
+            print(f"Error converting depth image: {e}")
+            return None
+
+    def load_robocup_rosbag(
+        self,
+        bag_path: str,
+        max_frames: int = 100,
+        skip_frames: int = 0
+    ) -> int:
+        """
+        Convenience method to load RoboCup TIAGo rosbag with default topics.
+
+        Args:
+            bag_path: Path to RoboCup rosbag (e.g., datasets/robocup/storing_try_2)
+            max_frames: Maximum frames to load
+            skip_frames: Skip first N frames
+
+        Returns:
+            Number of frames loaded
+        """
+        # Set TIAGo intrinsics as default
+        self.intrinsics = CameraIntrinsics.from_robocup_tiago()
+
+        return self.load_rosbag_sequence(
+            bag_path,
+            rgb_topic=TIAGO_RGB_TOPIC,
+            depth_topic=TIAGO_DEPTH_TOPIC,
+            camera_info_topic=TIAGO_CAMERA_INFO_TOPIC,
+            max_frames=max_frames,
+            skip_frames=skip_frames
+        )
+
     def load_rosbag_frame(self, bag_path: str, rgb_topic: str, depth_topic: str,
                           frame_index: int = 0) -> Optional[RGBDFrame]:
         """
         Extract a single frame from ROS2 rosbag.
 
-        Note: Requires rosbag2_py which is part of ROS2 installation.
-        Falls back to mcap direct reading if rosbag2_py not available.
+        Note: For loading multiple frames, use load_rosbag_sequence() instead.
         """
-        try:
-            return self._load_rosbag_ros2(bag_path, rgb_topic, depth_topic, frame_index)
-        except ImportError:
-            print("rosbag2_py not available, trying mcap direct read...")
-            return self._load_rosbag_mcap(bag_path, rgb_topic, depth_topic, frame_index)
-
-    def _load_rosbag_ros2(self, bag_path: str, rgb_topic: str, depth_topic: str,
-                          frame_index: int) -> Optional[RGBDFrame]:
-        """Load from rosbag using rosbag2_py."""
-        from rosbag2_py import SequentialReader, StorageOptions, ConverterOptions
-        from rclpy.serialization import deserialize_message
-        from sensor_msgs.msg import Image
-
-        storage_options = StorageOptions(uri=bag_path, storage_id='mcap')
-        converter_options = ConverterOptions(
-            input_serialization_format='cdr',
-            output_serialization_format='cdr'
+        count = self.load_rosbag_sequence(
+            bag_path, rgb_topic, depth_topic,
+            max_frames=frame_index + 1, skip_frames=frame_index
         )
-
-        reader = SequentialReader()
-        reader.open(storage_options, converter_options)
-
-        rgb_msg = None
-        depth_msg = None
-        rgb_count = 0
-        depth_count = 0
-
-        while reader.has_next():
-            topic, data, ts = reader.read_next()
-
-            if topic == rgb_topic:
-                if rgb_count == frame_index:
-                    rgb_msg = deserialize_message(data, Image)
-                rgb_count += 1
-            elif topic == depth_topic:
-                if depth_count == frame_index:
-                    depth_msg = deserialize_message(data, Image)
-                depth_count += 1
-
-            if rgb_msg and depth_msg:
-                break
-
-        if rgb_msg is None or depth_msg is None:
-            return None
-
-        # Convert RGB
-        if rgb_msg.encoding in ['rgb8', 'bgr8']:
-            rgb = np.frombuffer(rgb_msg.data, dtype=np.uint8)
-            rgb = rgb.reshape((rgb_msg.height, rgb_msg.width, 3))
-            if rgb_msg.encoding == 'bgr8':
-                rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
-        else:
-            print(f"Unsupported RGB encoding: {rgb_msg.encoding}")
-            return None
-
-        # Convert Depth
-        if depth_msg.encoding == '16UC1':
-            depth = np.frombuffer(depth_msg.data, dtype=np.uint16)
-            depth = depth.reshape((depth_msg.height, depth_msg.width))
-            depth_m = depth.astype(np.float32) / self.intrinsics.depth_scale
-        elif depth_msg.encoding == '32FC1':
-            depth_m = np.frombuffer(depth_msg.data, dtype=np.float32)
-            depth_m = depth_m.reshape((depth_msg.height, depth_msg.width))
-        else:
-            print(f"Unsupported depth encoding: {depth_msg.encoding}")
-            return None
-
-        return RGBDFrame(rgb=rgb, depth=depth_m, timestamp=ts / 1e9)
-
-    def _load_rosbag_mcap(self, bag_path: str, rgb_topic: str, depth_topic: str,
-                          frame_index: int) -> Optional[RGBDFrame]:
-        """Load from mcap rosbag directly without ROS2."""
-        try:
-            from mcap.reader import make_reader
-            from mcap_ros2.decoder import DecoderFactory
-        except ImportError:
-            print("mcap and mcap-ros2-support packages required.")
-            print("Install with: pip install mcap mcap-ros2-support")
-            return None
-
-        bag_file = Path(bag_path)
-        if bag_file.is_dir():
-            # Find .mcap file in directory
-            mcap_files = list(bag_file.glob("*.mcap"))
-            if not mcap_files:
-                print(f"No .mcap file found in {bag_path}")
-                return None
-            bag_file = mcap_files[0]
-
-        rgb_data = None
-        depth_data = None
-        rgb_count = 0
-        depth_count = 0
-
-        with open(bag_file, "rb") as f:
-            reader = make_reader(f, decoder_factories=[DecoderFactory()])
-
-            for schema, channel, message, decoded_msg in reader.iter_decoded_messages():
-                if channel.topic == rgb_topic:
-                    if rgb_count == frame_index:
-                        rgb_data = decoded_msg
-                    rgb_count += 1
-                elif channel.topic == depth_topic:
-                    if depth_count == frame_index:
-                        depth_data = decoded_msg
-                    depth_count += 1
-
-                if rgb_data and depth_data:
-                    break
-
-        if rgb_data is None or depth_data is None:
-            return None
-
-        # Convert messages to numpy arrays
-        rgb = np.array(rgb_data.data, dtype=np.uint8)
-        rgb = rgb.reshape((rgb_data.height, rgb_data.width, 3))
-        if rgb_data.encoding == 'bgr8':
-            rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
-
-        if depth_data.encoding == '16UC1':
-            depth = np.array(depth_data.data, dtype=np.uint16)
-            depth = depth.reshape((depth_data.height, depth_data.width))
-            depth_m = depth.astype(np.float32) / self.intrinsics.depth_scale
-        else:
-            depth_m = np.array(depth_data.data, dtype=np.float32)
-            depth_m = depth_m.reshape((depth_data.height, depth_data.width))
-
-        return RGBDFrame(rgb=rgb, depth=depth_m)
+        if count > 0:
+            return self._frames[0]
+        return None
 
     @property
     def frame_count(self) -> int:

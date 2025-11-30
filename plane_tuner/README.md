@@ -43,6 +43,7 @@ pip install -r requirements.txt
 - open3d
 - scipy
 - Pillow
+- rosbags（ROS2 rosbag読み込み用 - ROS2環境不要）
 - PyYAML（オプション：パラメータエクスポート用）
 
 ## 使用方法
@@ -65,15 +66,45 @@ python plane_tuner.py --rgb image_rgb.png --depth image_depth.png
 python plane_tuner.py --dataset /path/to/rgbd_dataset_freiburg1_desk --preset tum-freiburg1
 ```
 
+### RoboCup rosbagを読み込んで起動
+
+```bash
+# RoboCup TIAGoデータセット（storing_try_2など）
+python plane_tuner.py --rosbag datasets/robocup/storing_try_2 --preset robocup-tiago
+
+# 最初の50フレームをスキップして100フレーム読み込み
+python plane_tuner.py --rosbag datasets/robocup/storing_try_2 --skip-frames 50 --max-frames 100
+
+# カスタムトピックを指定
+python plane_tuner.py --rosbag /path/to/rosbag \
+    --rgb-topic /camera/rgb/image_raw \
+    --depth-topic /camera/depth/image_raw
+```
+
 ### カメラパラメータを指定
 
 ```bash
 # TIAGoロボットのカメラパラメータを使用
 python plane_tuner.py --preset tiago --depth-scale 1000
 
+# RoboCup TIAGoデータセット用プリセット
+python plane_tuner.py --preset robocup-tiago
+
 # TUMデータセットのカメラパラメータを使用
 python plane_tuner.py --preset tum-freiburg1 --depth-scale 5000
 ```
+
+### RoboCupデータセットのダウンロード
+
+RoboCup rosbagは[Zenodo](https://zenodo.org/record/13838208)からダウンロードできます。
+
+```bash
+cd datasets/robocup
+pip install zenodo-get
+zenodo_get 13838208
+```
+
+詳細は `datasets/robocup/README.md` を参照してください。
 
 ## GUI操作
 

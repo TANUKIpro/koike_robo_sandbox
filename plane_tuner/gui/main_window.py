@@ -15,11 +15,18 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from gui.parameter_panel import ParameterPanel
 from gui.image_canvas import ImageCanvas, PlaneInfoPanel
-from core.image_loader import ImageLoader, RGBDFrame, CameraIntrinsics
+from core.image_loader import (
+    ImageLoader, RGBDFrame, CameraIntrinsics,
+    TIAGO_RGB_TOPIC, TIAGO_DEPTH_TOPIC
+)
 from core.point_cloud import create_point_cloud
 from core.plane_detector import (
     PlaneDetector, PlaneDetectionParams, create_overlay, draw_plane_info
 )
+
+
+# Default paths for RoboCup datasets
+DEFAULT_ROBOCUP_PATH = "datasets/robocup/storing_try_2"
 
 
 class CameraIntrinsicsDialog(tk.Toplevel):
@@ -44,7 +51,7 @@ class CameraIntrinsicsDialog(tk.Toplevel):
         # Preset selector
         ttk.Label(frame, text="Presets:").grid(row=0, column=0, sticky='w', pady=5)
         presets = ['Custom', 'TUM Freiburg1', 'TUM Freiburg2', 'TUM Freiburg3',
-                   'TIAGo', 'RealSense D435']
+                   'TIAGo', 'RoboCup TIAGo', 'RealSense D435']
         self.preset_var = tk.StringVar(value='Custom')
         preset_cb = ttk.Combobox(frame, textvariable=self.preset_var,
                                  values=presets, state='readonly')
@@ -89,6 +96,7 @@ class CameraIntrinsicsDialog(tk.Toplevel):
             'TUM Freiburg2': CameraIntrinsics.from_tum_freiburg2(),
             'TUM Freiburg3': CameraIntrinsics.from_tum_freiburg3(),
             'TIAGo': CameraIntrinsics.from_tiago(),
+            'RoboCup TIAGo': CameraIntrinsics.from_robocup_tiago(),
             'RealSense D435': CameraIntrinsics.from_realsense_d435(),
         }
 
@@ -155,6 +163,7 @@ class MainWindow:
         file_menu.add_separator()
         file_menu.add_command(label="Load TUM Dataset...", command=self._load_tum_dataset)
         file_menu.add_command(label="Load ROS2 Bag...", command=self._load_rosbag)
+        file_menu.add_command(label="Load RoboCup Rosbag...", command=self._load_robocup_rosbag)
         file_menu.add_separator()
         file_menu.add_command(label="Save Current Frame...", command=self._save_frame)
         file_menu.add_command(label="Export Parameters...", command=self._export_params)
@@ -316,19 +325,67 @@ class MainWindow:
         self.root.wait_window(dialog)
 
         if dialog.result:
-            rgb_topic, depth_topic, frame_index = dialog.result
+            rgb_topic, depth_topic, max_frames = dialog.result
 
             self.status_var.set("Loading rosbag...")
             self.root.update()
 
-            frame = self.image_loader.load_rosbag_frame(
-                path, rgb_topic, depth_topic, frame_index
+            count = self.image_loader.load_rosbag_sequence(
+                path, rgb_topic, depth_topic, max_frames=max_frames
             )
-            if frame:
-                self._set_current_frame(frame)
-                self.status_var.set(f"Loaded frame {frame_index} from rosbag")
+            if count > 0:
+                self._update_frame_slider()
+                frame = self.image_loader.get_frame(0)
+                if frame:
+                    self._set_current_frame(frame)
+                self.status_var.set(f"Loaded {count} frames from rosbag")
             else:
-                messagebox.showerror("Error", "Failed to load rosbag frame")
+                messagebox.showerror("Error", "Failed to load rosbag. Check console for details.")
+
+    def _load_robocup_rosbag(self):
+        """Load RoboCup TIAGo rosbag with default settings."""
+        # Try default path first
+        default_path = Path(__file__).parent.parent.parent / DEFAULT_ROBOCUP_PATH
+        if default_path.exists():
+            initial_dir = str(default_path.parent)
+        else:
+            initial_dir = str(Path.cwd())
+
+        path = filedialog.askdirectory(
+            title="Select RoboCup Rosbag Directory (e.g., storing_try_2)",
+            initialdir=initial_dir
+        )
+        if not path:
+            return
+
+        # Show loading dialog
+        dialog = RobocupLoadDialog(self.root)
+        self.root.wait_window(dialog)
+
+        if dialog.result:
+            max_frames, skip_frames = dialog.result
+
+            self.status_var.set("Loading RoboCup rosbag...")
+            self.root.update()
+
+            count = self.image_loader.load_robocup_rosbag(
+                path, max_frames=max_frames, skip_frames=skip_frames
+            )
+            if count > 0:
+                self._update_frame_slider()
+                frame = self.image_loader.get_frame(0)
+                if frame:
+                    self._set_current_frame(frame)
+                self.status_var.set(f"Loaded {count} frames from RoboCup rosbag")
+            else:
+                messagebox.showerror(
+                    "Error",
+                    "Failed to load RoboCup rosbag.\n\n"
+                    "Please ensure:\n"
+                    "1. The rosbag is downloaded (see datasets/robocup/README.md)\n"
+                    "2. 'rosbags' package is installed: pip install rosbags\n\n"
+                    "Check console for detailed error messages."
+                )
 
     def _save_frame(self):
         """Save current frame."""
@@ -544,7 +601,7 @@ class RosbagTopicDialog(tk.Toplevel):
     def __init__(self, parent):
         super().__init__(parent)
         self.title("Rosbag Topics")
-        self.geometry("400x200")
+        self.geometry("450x220")
         self.transient(parent)
         self.grab_set()
 
@@ -557,18 +614,18 @@ class RosbagTopicDialog(tk.Toplevel):
 
         # RGB topic
         ttk.Label(frame, text="RGB Topic:").grid(row=0, column=0, sticky='w', pady=5)
-        self.rgb_var = tk.StringVar(value="/head_front_camera/rgb/image_raw")
+        self.rgb_var = tk.StringVar(value=TIAGO_RGB_TOPIC)
         ttk.Entry(frame, textvariable=self.rgb_var, width=40).grid(row=0, column=1, pady=5)
 
         # Depth topic
         ttk.Label(frame, text="Depth Topic:").grid(row=1, column=0, sticky='w', pady=5)
-        self.depth_var = tk.StringVar(value="/head_front_camera/depth/image_raw")
+        self.depth_var = tk.StringVar(value=TIAGO_DEPTH_TOPIC)
         ttk.Entry(frame, textvariable=self.depth_var, width=40).grid(row=1, column=1, pady=5)
 
-        # Frame index
-        ttk.Label(frame, text="Frame Index:").grid(row=2, column=0, sticky='w', pady=5)
-        self.frame_var = tk.IntVar(value=0)
-        ttk.Spinbox(frame, textvariable=self.frame_var, from_=0, to=1000, width=10).grid(
+        # Max frames
+        ttk.Label(frame, text="Max Frames:").grid(row=2, column=0, sticky='w', pady=5)
+        self.max_frames_var = tk.IntVar(value=100)
+        ttk.Spinbox(frame, textvariable=self.max_frames_var, from_=1, to=2000, width=10).grid(
             row=2, column=1, sticky='w', pady=5
         )
 
@@ -580,7 +637,62 @@ class RosbagTopicDialog(tk.Toplevel):
         ttk.Button(btn_frame, text="Cancel", command=self._on_cancel).pack(side='left', padx=5)
 
     def _on_ok(self):
-        self.result = (self.rgb_var.get(), self.depth_var.get(), self.frame_var.get())
+        self.result = (self.rgb_var.get(), self.depth_var.get(), self.max_frames_var.get())
+        self.destroy()
+
+    def _on_cancel(self):
+        self.destroy()
+
+
+class RobocupLoadDialog(tk.Toplevel):
+    """Dialog for RoboCup rosbag loading options."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("RoboCup Rosbag Options")
+        self.geometry("350x180")
+        self.transient(parent)
+        self.grab_set()
+
+        self.result = None
+        self._create_widgets()
+
+    def _create_widgets(self):
+        frame = ttk.Frame(self, padding=10)
+        frame.pack(fill='both', expand=True)
+
+        # Info label
+        info = ttk.Label(
+            frame,
+            text="Loading RoboCup TIAGo rosbag\n"
+                 "(Topics: /head_front_camera/rgb/image_raw, depth/image_raw)",
+            justify='center'
+        )
+        info.grid(row=0, column=0, columnspan=2, pady=10)
+
+        # Max frames
+        ttk.Label(frame, text="Max Frames:").grid(row=1, column=0, sticky='w', pady=5)
+        self.max_frames_var = tk.IntVar(value=100)
+        ttk.Spinbox(frame, textvariable=self.max_frames_var, from_=1, to=2000, width=10).grid(
+            row=1, column=1, sticky='w', pady=5
+        )
+
+        # Skip frames
+        ttk.Label(frame, text="Skip First N Frames:").grid(row=2, column=0, sticky='w', pady=5)
+        self.skip_frames_var = tk.IntVar(value=0)
+        ttk.Spinbox(frame, textvariable=self.skip_frames_var, from_=0, to=1000, width=10).grid(
+            row=2, column=1, sticky='w', pady=5
+        )
+
+        # Buttons
+        btn_frame = ttk.Frame(frame)
+        btn_frame.grid(row=3, column=0, columnspan=2, pady=15)
+
+        ttk.Button(btn_frame, text="Load", command=self._on_ok).pack(side='left', padx=5)
+        ttk.Button(btn_frame, text="Cancel", command=self._on_cancel).pack(side='left', padx=5)
+
+    def _on_ok(self):
+        self.result = (self.max_frames_var.get(), self.skip_frames_var.get())
         self.destroy()
 
     def _on_cancel(self):
