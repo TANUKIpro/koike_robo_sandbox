@@ -1,0 +1,16 @@
+# Plane Detection Parameter Tuner - Dependencies
+# Python 3.8+ required
+
+# Core dependencies
+numpy>=1.20.0
+opencv-python>=4.5.0
+open3d>=0.15.0
+scipy>=1.7.0
+Pillow>=8.0.0
+
+# Optional: For YAML export
+PyYAML>=6.0
+
+# Optional: For rosbag reading without ROS2
+# mcap>=1.0.0
+# mcap-ros2-support>=0.5.0
