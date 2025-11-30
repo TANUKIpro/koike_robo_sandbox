@@ -9,13 +9,17 @@
 #   ./run_plane_detection.sh /path/to/rosbag --loop
 #   ./run_plane_detection.sh /path/to/rosbag --rate 0.5
 #   ./run_plane_detection.sh /path/to/rosbag --rviz
+#   ./run_plane_detection.sh /path/to/rosbag --min-area 0.01
+#   ./run_plane_detection.sh /path/to/rosbag --min-depth 0.2 --max-depth 8.0
 #
 # オプション:
-#   --loop          rosbagをループ再生
-#   --rate RATE     再生速度（デフォルト: 1.0）
-#   --rviz          RViz2も起動
-#   --min-area AREA 最小平面面積 (m^2, デフォルト: 0.05)
-#   --help          このヘルプを表示
+#   --loop              rosbagをループ再生
+#   --rate RATE         再生速度（デフォルト: 1.0）
+#   --rviz              RViz2も起動
+#   --min-area AREA     最小平面面積 (m^2, デフォルト: 0.05)
+#   --min-depth DEPTH   最小深度 (m, デフォルト: 0.1)
+#   --max-depth DEPTH   最大深度 (m, デフォルト: 10.0)
+#   --help              このヘルプを表示
 #
 
 set -e
@@ -31,6 +35,8 @@ LOOP="false"
 RATE="1.0"
 USE_RVIZ="false"
 MIN_AREA="0.05"
+MIN_DEPTH="0.1"
+MAX_DEPTH="10.0"
 
 # ヘルプ表示
 show_help() {
@@ -39,20 +45,23 @@ show_help() {
     echo "平面検出システム - rosbag再生からOpenCVウィンドウ表示まで1コマンドで実行"
     echo ""
     echo "Arguments:"
-    echo "  bag_path           ROS2 bagディレクトリへのパス"
+    echo "  bag_path              ROS2 bagディレクトリへのパス"
     echo ""
     echo "Options:"
-    echo "  --loop             rosbagをループ再生"
-    echo "  --rate RATE        再生速度 (デフォルト: 1.0)"
-    echo "  --rviz             RViz2も起動"
-    echo "  --min-area AREA    最小平面面積 m^2 (デフォルト: 0.05)"
-    echo "  --help             このヘルプを表示"
+    echo "  --loop                rosbagをループ再生"
+    echo "  --rate RATE           再生速度 (デフォルト: 1.0)"
+    echo "  --rviz                RViz2も起動"
+    echo "  --min-area AREA       最小平面面積 m^2 (デフォルト: 0.05)"
+    echo "  --min-depth DEPTH     最小深度 m (デフォルト: 0.1)"
+    echo "  --max-depth DEPTH     最大深度 m (デフォルト: 10.0)"
+    echo "  --help                このヘルプを表示"
     echo ""
     echo "Examples:"
     echo "  $0 datasets/robocup/storing_try_2"
     echo "  $0 datasets/robocup/storing_try_2 --loop"
     echo "  $0 datasets/robocup/storing_try_2 --rate 0.5 --loop"
-    echo "  $0 datasets/robocup/storing_try_2 --rviz"
+    echo "  $0 datasets/robocup/storing_try_2 --min-area 0.01"
+    echo "  $0 datasets/robocup/storing_try_2 --min-depth 0.3 --max-depth 5.0"
     exit 0
 }
 
@@ -76,6 +85,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --min-area)
             MIN_AREA="$2"
+            shift 2
+            ;;
+        --min-depth)
+            MIN_DEPTH="$2"
+            shift 2
+            ;;
+        --max-depth)
+            MAX_DEPTH="$2"
             shift 2
             ;;
         *)
@@ -119,6 +136,7 @@ echo "Loop: $LOOP"
 echo "Rate: $RATE"
 echo "RViz: $USE_RVIZ"
 echo "Min area: $MIN_AREA m^2"
+echo "Depth range: $MIN_DEPTH - $MAX_DEPTH m"
 echo "============================================"
 
 # ROS2ワークスペースをセットアップ
@@ -143,4 +161,6 @@ ros2 launch plane_detector plane_detection.launch.py \
     loop:="$LOOP" \
     rate:="$RATE" \
     use_rviz:="$USE_RVIZ" \
-    min_plane_area:="$MIN_AREA"
+    min_plane_area:="$MIN_AREA" \
+    min_depth:="$MIN_DEPTH" \
+    max_depth:="$MAX_DEPTH"

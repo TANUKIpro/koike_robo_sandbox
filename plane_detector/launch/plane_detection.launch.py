@@ -24,6 +24,16 @@ OpenCVウィンドウで可視化を表示します。
     ros2 launch plane_detector plane_detection.launch.py \
         bag_path:=/path/to/datasets/robocup/storing_try_2 \
         use_rviz:=true
+
+    # 面積閾値を変更（小さい平面も検出）
+    ros2 launch plane_detector plane_detection.launch.py \
+        bag_path:=/path/to/rosbag \
+        min_plane_area:=0.01
+
+    # デプス範囲を変更
+    ros2 launch plane_detector plane_detection.launch.py \
+        bag_path:=/path/to/rosbag \
+        min_depth:=0.2 max_depth:=8.0
 """
 
 import os
@@ -101,6 +111,18 @@ def generate_launch_description():
         description='Minimum plane area in m^2 (default: 0.05 = 22cm x 22cm)'
     )
 
+    min_depth_arg = DeclareLaunchArgument(
+        'min_depth',
+        default_value='0.1',
+        description='Minimum depth in meters (default: 0.1m)'
+    )
+
+    max_depth_arg = DeclareLaunchArgument(
+        'max_depth',
+        default_value='10.0',
+        description='Maximum depth in meters (default: 10.0m)'
+    )
+
     show_window_arg = DeclareLaunchArgument(
         'show_window',
         default_value='true',
@@ -148,8 +170,8 @@ def generate_launch_description():
             'camera_frame': 'head_front_camera_depth_optical_frame',
             'base_frame': 'base_footprint',
             'depth_scale': 1000.0,  # mm -> m for TIAGo
-            'min_depth': 0.3,
-            'max_depth': 5.0,
+            'min_depth': LaunchConfiguration('min_depth'),
+            'max_depth': LaunchConfiguration('max_depth'),
             'downsample_factor': 4,
             'distance_threshold': 0.02,
             'min_plane_points': 500,
@@ -187,6 +209,8 @@ def generate_launch_description():
         process_rate_arg,
         normal_threshold_arg,
         min_plane_area_arg,
+        min_depth_arg,
+        max_depth_arg,
         show_window_arg,
 
         # プロセス

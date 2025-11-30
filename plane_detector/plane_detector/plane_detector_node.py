@@ -155,8 +155,8 @@ class PlaneDetectorNode(Node):
 
         # 深度処理設定
         self.declare_parameter('depth_scale', 1000.0)  # mm -> m
-        self.declare_parameter('min_depth', 0.3)
-        self.declare_parameter('max_depth', 5.0)
+        self.declare_parameter('min_depth', 0.1)  # 最小深度 0.1m（ほぼ制限なし）
+        self.declare_parameter('max_depth', 10.0)  # 最大深度 10m（ほぼ制限なし）
         self.declare_parameter('downsample_factor', 4)
 
         # RANSAC設定
@@ -234,29 +234,29 @@ class PlaneDetectorNode(Node):
             if depth is None:
                 return
 
+            # 平面検出を試みる（失敗しても画像は表示）
+            detected_planes = []
+
             # TF取得
             transform = self._get_transform(rgb_msg.header.stamp)
-            if transform is None:
-                return
+            if transform is not None:
+                # 点群生成
+                points_camera = self._create_pointcloud(depth)
+                if len(points_camera) >= self.min_plane_points:
+                    # 点群をbase_footprint座標系に変換
+                    points_base = self._transform_points(points_camera, transform)
 
-            # 点群生成
-            points_camera = self._create_pointcloud(depth)
-            if len(points_camera) < self.min_plane_points:
-                self.get_logger().warn('Not enough points in point cloud',
-                                       throttle_duration_sec=2.0)
-                return
+                    # 重力方向の取得（base_footprint座標系ではZ軸が上向き）
+                    gravity_direction = np.array([0.0, 0.0, 1.0])
 
-            # 点群をbase_footprint座標系に変換
-            points_base = self._transform_points(points_camera, transform)
+                    # 平面検出（面積ベースで全ての水平平面を検出）
+                    detected_planes = self._detect_planes(
+                        points_camera, points_base, gravity_direction)
+                else:
+                    self.get_logger().debug('Not enough points in point cloud',
+                                           throttle_duration_sec=2.0)
 
-            # 重力方向の取得（base_footprint座標系ではZ軸が上向き）
-            gravity_direction = np.array([0.0, 0.0, 1.0])
-
-            # 平面検出（面積ベースで全ての水平平面を検出）
-            detected_planes = self._detect_planes(
-                points_camera, points_base, gravity_direction)
-
-            # 可視化
+            # 可視化（平面が検出されなくても画像は表示）
             self._publish_markers(detected_planes, rgb_msg.header)
             self._publish_overlay(rgb, depth, detected_planes, rgb_msg.header)
 
