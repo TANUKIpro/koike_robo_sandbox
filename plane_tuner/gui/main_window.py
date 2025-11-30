@@ -212,15 +212,19 @@ class MainWindow:
         self.prev_btn = ttk.Button(frame_bar, text="<", width=3, command=self._prev_frame)
         self.prev_btn.pack(side='left', padx=2)
 
-        # Frame slider
+        # Frame slider (no command - use ButtonRelease to avoid continuous loading)
         self.frame_slider_var = tk.IntVar(value=0)
         self.frame_slider = ttk.Scale(
             frame_bar, from_=0, to=0,
             variable=self.frame_slider_var,
-            orient='horizontal',
-            command=self._on_frame_slider
+            orient='horizontal'
         )
         self.frame_slider.pack(side='left', fill='x', expand=True, padx=5)
+
+        # Bind events for proper slider behavior
+        self.frame_slider.bind('<ButtonRelease-1>', self._on_frame_slider_release)
+        self.frame_slider.bind('<Button-1>', self._on_frame_slider_click)
+        self._slider_dragging = False
 
         # Next button
         self.next_btn = ttk.Button(frame_bar, text=">", width=3, command=self._next_frame)
@@ -576,11 +580,50 @@ class MainWindow:
         """Go to next frame."""
         self._load_frame_at(self.image_loader._current_index + 1)
 
-    def _on_frame_slider(self, value):
-        """Handle frame slider change."""
-        index = int(float(value))
+    def _on_frame_slider_click(self, event):
+        """Handle click on frame slider - jump to clicked position."""
+        # Calculate position from click coordinates
+        slider = self.frame_slider
+        slider_length = slider.winfo_width()
+        if slider_length <= 0:
+            return
+
+        # Get the trough area (excluding margins)
+        # ttk.Scale has some padding, approximate it
+        margin = 10
+        effective_length = slider_length - 2 * margin
+        click_pos = event.x - margin
+
+        if effective_length <= 0:
+            return
+
+        # Calculate frame index from click position
+        count = self.image_loader.frame_count
+        max_frame = count - 1
+        if max_frame <= 0:
+            return
+
+        ratio = max(0.0, min(1.0, click_pos / effective_length))
+        target_index = int(round(ratio * max_frame))
+
+        # Update slider position immediately (visual feedback)
+        self.frame_slider_var.set(target_index)
+        self._slider_dragging = True
+
+        # Update label to show target frame
+        self.frame_label.config(text=f"-> Frame: {target_index + 1}/{count}")
+
+    def _on_frame_slider_release(self, event):
+        """Handle mouse release on frame slider - load the frame."""
+        # Get current slider value and load frame
+        index = int(self.frame_slider_var.get())
+        self._slider_dragging = False
+
         if index != self.image_loader._current_index:
             self._load_frame_at(index)
+        else:
+            # Just update the label if same frame
+            self._update_frame_label()
 
     def _load_frame_at(self, index: int):
         """Load and display frame at given index."""
