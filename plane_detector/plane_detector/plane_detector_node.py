@@ -44,9 +44,10 @@ from enum import Enum
 class PlaneType(Enum):
     """平面の種類"""
     UNKNOWN = 0
-    FLOOR = 1
-    TABLE = 2
-    SHELF = 3
+    FLOOR = 1      # 床面（参照用、検知対象外）
+    TABLE = 2      # テーブル面
+    SHELF = 3      # 棚
+    HORIZONTAL = 4  # 水平平面（床より上）
 
 
 @dataclass
@@ -118,10 +119,11 @@ class PlaneDetectorNode(Node):
 
         # 平面の色定義
         self.plane_colors = {
-            PlaneType.FLOOR: (0.5, 0.5, 0.5),    # 灰色
-            PlaneType.TABLE: (0.0, 1.0, 0.0),    # 緑色
-            PlaneType.SHELF: (0.0, 0.5, 1.0),    # 青色
-            PlaneType.UNKNOWN: (1.0, 1.0, 0.0),  # 黄色
+            PlaneType.FLOOR: (0.3, 0.3, 0.3),      # 暗い灰色（固定・参照用）
+            PlaneType.TABLE: (0.0, 1.0, 0.0),      # 緑色
+            PlaneType.SHELF: (0.0, 0.5, 1.0),      # 青色
+            PlaneType.HORIZONTAL: (1.0, 0.5, 0.0), # オレンジ色（水平平面）
+            PlaneType.UNKNOWN: (1.0, 1.0, 0.0),    # 黄色
         }
 
         self.get_logger().info('Plane Detector Node started')
@@ -130,6 +132,9 @@ class PlaneDetectorNode(Node):
         self.get_logger().info(f'  Camera frame: {self.camera_frame}')
         self.get_logger().info(f'  Base frame: {self.base_frame}')
         self.get_logger().info(f'  Show window: {self.show_window}')
+        self.get_logger().info(f'  Normal threshold: {self.normal_threshold_deg} deg')
+        self.get_logger().info(f'  Detection height range: {self.min_detection_height}m - {self.max_detection_height}m')
+        self.get_logger().info(f'  Floor height: {self.floor_height}m (tolerance: {self.floor_tolerance}m)')
 
     def _declare_parameters(self):
         """パラメータの宣言"""
@@ -154,10 +159,18 @@ class PlaneDetectorNode(Node):
         self.declare_parameter('num_iterations', 1000)
         self.declare_parameter('min_plane_points', 500)
 
-        # 法線角度制約
-        self.declare_parameter('normal_threshold_deg', 15.0)
+        # 法線角度制約（水平平面のみ検出するための閾値）
+        self.declare_parameter('normal_threshold_deg', 10.0)  # より厳しく
 
-        # 高さによる分類
+        # 床面の設定（固定高さ）
+        self.declare_parameter('floor_height', 0.0)  # 床面の高さ（base_footprint基準）
+        self.declare_parameter('floor_tolerance', 0.10)  # 床面判定の許容誤差
+
+        # 検知対象の高さ範囲（床より上の平面を検知）
+        self.declare_parameter('min_detection_height', 0.15)  # この高さ以上を検知
+        self.declare_parameter('max_detection_height', 2.0)  # この高さ以下を検知
+
+        # 高さによる分類（後方互換性のため残す）
         self.declare_parameter('floor_height_max', 0.15)
         self.declare_parameter('table_height_min', 0.40)
         self.declare_parameter('table_height_max', 1.20)
@@ -191,6 +204,15 @@ class PlaneDetectorNode(Node):
         self.normal_threshold_deg = self.get_parameter('normal_threshold_deg').value
         self.normal_threshold_rad = np.deg2rad(self.normal_threshold_deg)
 
+        # 床面の設定
+        self.floor_height = self.get_parameter('floor_height').value
+        self.floor_tolerance = self.get_parameter('floor_tolerance').value
+
+        # 検知対象の高さ範囲
+        self.min_detection_height = self.get_parameter('min_detection_height').value
+        self.max_detection_height = self.get_parameter('max_detection_height').value
+
+        # 高さによる分類（後方互換性）
         self.floor_height_max = self.get_parameter('floor_height_max').value
         self.table_height_min = self.get_parameter('table_height_min').value
         self.table_height_max = self.get_parameter('table_height_max').value
@@ -364,7 +386,7 @@ class PlaneDetectorNode(Node):
 
     def _detect_planes(self, points_camera: np.ndarray, points_base: np.ndarray,
                        gravity_direction: np.ndarray, rgb: np.ndarray) -> List[DetectedPlane]:
-        """RANSAC + 法線制約で水平平面を検出"""
+        """RANSAC + 法線制約で水平平面のみを検出（床より上の平面を対象）"""
         detected_planes = []
 
         # Open3D点群に変換
@@ -372,9 +394,17 @@ class PlaneDetectorNode(Node):
         pcd.points = o3d.utility.Vector3dVector(points_base)
 
         remaining_indices = np.arange(len(points_base))
+        non_horizontal_count = 0  # 非水平平面の連続検出カウント
+        max_non_horizontal_skip = 3  # これ以上連続で非水平なら終了
 
-        for i in range(self.max_planes):
+        for i in range(self.max_planes + max_non_horizontal_skip):
             if len(remaining_indices) < self.min_plane_points:
+                break
+
+            # 非水平平面が連続で検出されすぎたら終了
+            if non_horizontal_count >= max_non_horizontal_skip:
+                self.get_logger().debug(
+                    f'Stopping: {non_horizontal_count} consecutive non-horizontal planes')
                 break
 
             # 現在の点群を抽出
@@ -402,22 +432,57 @@ class PlaneDetectorNode(Node):
             if normal[2] < 0:
                 normal = -normal
 
-            # 重力方向との角度をチェック
+            # 重力方向との角度をチェック（水平平面の判定）
             angle = np.arccos(np.clip(np.dot(normal, gravity_direction), -1.0, 1.0))
+            angle_deg = np.rad2deg(angle)
 
-            if angle < self.normal_threshold_rad:
-                # 水平平面として採用
-                actual_indices = remaining_indices[inliers]
-                plane_points = points_base[actual_indices]
+            # 水平平面でない場合はスキップ（点群からは削除しない）
+            if angle > self.normal_threshold_rad:
+                non_horizontal_count += 1
+                self.get_logger().debug(
+                    f'Skipping non-horizontal plane: angle={angle_deg:.1f}deg > threshold={self.normal_threshold_deg}deg')
+                # 非水平平面の点を削除して次へ（でないと同じ平面が検出され続ける）
+                mask = np.ones(len(remaining_indices), dtype=bool)
+                mask[inliers] = False
+                remaining_indices = remaining_indices[mask]
+                continue
 
-                # 平面の中心と高さ
-                center = np.mean(plane_points, axis=0)
-                height = center[2]
+            # 水平平面として採用
+            non_horizontal_count = 0  # リセット
+            actual_indices = remaining_indices[inliers]
+            plane_points = points_base[actual_indices]
 
-                # 平面タイプの分類
+            # 平面の中心と高さ
+            center = np.mean(plane_points, axis=0)
+            height = center[2]
+
+            # 床面かどうかの判定（床は固定高さ付近）
+            is_floor = abs(height - self.floor_height) < self.floor_tolerance
+
+            if is_floor:
+                # 床面は固定色で記録（検知対象外だが参照として表示）
+                plane_type = PlaneType.FLOOR
+                color = self.plane_colors[PlaneType.FLOOR]
+
+                detected_plane = DetectedPlane(
+                    plane_type=plane_type,
+                    coefficients=plane_model,
+                    inlier_indices=actual_indices,
+                    center=center,
+                    height=height,
+                    normal=normal,
+                    points=plane_points,
+                    color=color
+                )
+                detected_planes.append(detected_plane)
+
+                self.get_logger().info(
+                    f'Floor detected (reference): height={height:.2f}m, '
+                    f'points={len(inliers)}, angle={angle_deg:.1f}deg')
+
+            elif height >= self.min_detection_height and height <= self.max_detection_height:
+                # 床より上の水平平面を検知対象として採用
                 plane_type = self._classify_plane(height)
-
-                # 色の取得
                 color = self.plane_colors[plane_type]
 
                 detected_plane = DetectedPlane(
@@ -434,26 +499,32 @@ class PlaneDetectorNode(Node):
 
                 self.get_logger().info(
                     f'Detected {plane_type.name}: height={height:.2f}m, '
-                    f'points={len(inliers)}, angle={np.rad2deg(angle):.1f}deg'
-                )
+                    f'points={len(inliers)}, angle={angle_deg:.1f}deg')
+            else:
+                self.get_logger().debug(
+                    f'Skipping plane outside height range: height={height:.2f}m')
 
             # 検出した平面の点を除去
             mask = np.ones(len(remaining_indices), dtype=bool)
             mask[inliers] = False
             remaining_indices = remaining_indices[mask]
 
+            # 検出した平面が最大数に達したら終了
+            if len([p for p in detected_planes if p.plane_type != PlaneType.FLOOR]) >= self.max_planes:
+                break
+
         return detected_planes
 
     def _classify_plane(self, height: float) -> PlaneType:
-        """高さに基づいて平面を分類"""
-        if height < self.floor_height_max:
-            return PlaneType.FLOOR
-        elif self.table_height_min <= height <= self.table_height_max:
+        """高さに基づいて平面を分類（床面は別処理のため除外）"""
+        # 床面は_detect_planesで別途判定されるのでここでは判定しない
+        if self.table_height_min <= height <= self.table_height_max:
             return PlaneType.TABLE
         elif height > self.table_height_max:
             return PlaneType.SHELF
         else:
-            return PlaneType.UNKNOWN
+            # 床面とテーブルの間の高さの平面（中間領域）
+            return PlaneType.HORIZONTAL
 
     def _publish_markers(self, planes: List[DetectedPlane], header: Header):
         """検出した平面をMarkerArrayとして公開"""

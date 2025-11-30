@@ -78,8 +78,26 @@ def generate_launch_description():
 
     normal_threshold_arg = DeclareLaunchArgument(
         'normal_threshold_deg',
-        default_value='15.0',
+        default_value='10.0',
         description='Normal angle threshold for horizontal plane detection (degrees)'
+    )
+
+    floor_height_arg = DeclareLaunchArgument(
+        'floor_height',
+        default_value='0.0',
+        description='Floor height in base_footprint frame (meters)'
+    )
+
+    min_detection_height_arg = DeclareLaunchArgument(
+        'min_detection_height',
+        default_value='0.15',
+        description='Minimum height to detect planes (meters, above floor)'
+    )
+
+    max_detection_height_arg = DeclareLaunchArgument(
+        'max_detection_height',
+        default_value='2.0',
+        description='Maximum height to detect planes (meters)'
     )
 
     # ROSbag再生コマンドの構築
@@ -129,6 +147,13 @@ def generate_launch_description():
             'min_plane_points': 500,
             'normal_threshold_deg': LaunchConfiguration('normal_threshold_deg'),
             'process_rate': LaunchConfiguration('process_rate'),
+            # 床面の設定
+            'floor_height': LaunchConfiguration('floor_height'),
+            'floor_tolerance': 0.10,
+            # 検知対象の高さ範囲
+            'min_detection_height': LaunchConfiguration('min_detection_height'),
+            'max_detection_height': LaunchConfiguration('max_detection_height'),
+            # 高さによる分類
             'floor_height_max': 0.15,
             'table_height_min': 0.40,
             'table_height_max': 1.20,
@@ -157,6 +182,9 @@ def generate_launch_description():
         rviz_config_arg,
         process_rate_arg,
         normal_threshold_arg,
+        floor_height_arg,
+        min_detection_height_arg,
+        max_detection_height_arg,
 
         # プロセス
         bag_play_with_loop,
