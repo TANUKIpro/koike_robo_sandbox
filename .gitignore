@@ -1,0 +1,99 @@
+# ===================
+# Dataset files (large)
+# ===================
+
+# ROS bag files
+*.bag
+*.db3
+metadata.yaml
+
+# Compressed archives
+*.tgz
+*.tar.gz
+*.zip
+
+# Image data folders in datasets
+datasets/*/rgb/
+datasets/*/depth/
+datasets/*/rgb_*/
+datasets/*/depth_*/
+
+# TUM RGB-D specific
+datasets/tum_rgbd/rgbd_dataset_*/
+
+# ETH3D specific
+datasets/eth3d/*/raw_data/
+
+# VECtor specific
+datasets/vector/*/
+
+# RoboCup specific
+datasets/robocup/rosbag2_*/
+datasets/robocup/*_2023/
+datasets/robocup/*_2024/
+
+# Voxblox specific
+datasets/voxblox/*.bag
+
+# Converted ROS2 bags
+*_ros2/
+
+# ===================
+# Python
+# ===================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# ===================
+# IDE
+# ===================
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ===================
+# OS
+# ===================
+.DS_Store
+Thumbs.db
+
+# ===================
+# Jupyter
+# ===================
+.ipynb_checkpoints/
+
+# ===================
+# Output
+# ===================
+output/
+results/
+*.png
+*.jpg
+*.jpeg
+!datasets/**/README.md
