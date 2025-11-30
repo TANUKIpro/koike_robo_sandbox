@@ -98,3 +98,6 @@ results/
 *.jpg
 *.jpeg
 !datasets/**/README.md
+
+# gabage
+*:Zone.Identifier
