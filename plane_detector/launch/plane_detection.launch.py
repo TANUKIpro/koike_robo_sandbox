@@ -2,7 +2,8 @@
 """
 平面検出 Launch ファイル
 
-ROSbagの再生、平面検出ノード、RViz2を同時に起動します。
+ROSbagの再生と平面検出ノードを同時に起動します。
+OpenCVウィンドウで検出結果をリアルタイム表示します。
 
 使用例:
     ros2 launch plane_detector plane_detection.launch.py \
@@ -19,20 +20,14 @@ ROSbagの再生、平面検出ノード、RViz2を同時に起動します。
         rate:=0.5
 """
 
-import os
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess, TimerAction
+from launch.actions import DeclareLaunchArgument, ExecuteProcess
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch.conditions import IfCondition
 from launch_ros.actions import Node
-from ament_index_python.packages import get_package_share_directory
 
 
 def generate_launch_description():
-    # パッケージディレクトリ
-    pkg_dir = get_package_share_directory('plane_detector')
-    default_rviz_config = os.path.join(pkg_dir, 'config', 'plane_detection.rviz')
-
     # Launch引数の宣言
     bag_path_arg = DeclareLaunchArgument(
         'bag_path',
@@ -61,12 +56,6 @@ def generate_launch_description():
         'use_sim_time',
         default_value='true',
         description='Use simulation time'
-    )
-
-    rviz_config_arg = DeclareLaunchArgument(
-        'rviz_config',
-        default_value=default_rviz_config,
-        description='Path to RViz config file'
     )
 
     # パラメータ設定
@@ -157,19 +146,9 @@ def generate_launch_description():
             'floor_height_max': 0.15,
             'table_height_min': 0.40,
             'table_height_max': 1.20,
+            # OpenCVウィンドウで表示
+            'show_window': True,
         }]
-    )
-
-    # RViz2を遅延起動（TFが安定するまで待つ）
-    rviz_node = TimerAction(
-        period=2.0,  # 2秒待機
-        actions=[
-            ExecuteProcess(
-                cmd=['rviz2', '-d', LaunchConfiguration('rviz_config')],
-                name='rviz2',
-                output='screen'
-            )
-        ]
     )
 
     return LaunchDescription([
@@ -179,7 +158,6 @@ def generate_launch_description():
         loop_arg,
         start_offset_arg,
         use_sim_time_arg,
-        rviz_config_arg,
         process_rate_arg,
         normal_threshold_arg,
         floor_height_arg,
@@ -190,5 +168,4 @@ def generate_launch_description():
         bag_play_with_loop,
         bag_play_without_loop,
         plane_detector_node,
-        rviz_node,
     ])
