@@ -139,8 +139,8 @@ class PlaneRecorderNode(Node):
         self.declare_parameter('depth_topic', '/head_front_camera/depth/image_raw')
         self.declare_parameter('camera_info_topic', '/head_front_camera/rgb/camera_info')
 
-        # 座標系設定
-        self.declare_parameter('camera_frame', 'head_front_camera_rgb_optical_frame')
+        # 座標系設定（TIAGo rosbag対応）
+        self.declare_parameter('camera_frame', 'head_front_camera_depth_optical_frame')
         self.declare_parameter('base_frame', 'base_footprint')
 
         # 深度処理設定

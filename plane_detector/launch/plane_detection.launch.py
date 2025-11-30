@@ -2,9 +2,11 @@
 """
 平面検出 Launch ファイル
 
-ROSbagの再生、平面検出ノード、RViz2を同時に起動します。
+ROSbagの再生、平面検出ノードを同時に起動します。
+OpenCVウィンドウで可視化を表示します。
 
 使用例:
+    # 1コマンドで起動
     ros2 launch plane_detector plane_detection.launch.py \
         bag_path:=/path/to/datasets/robocup/storing_try_2
 
@@ -17,6 +19,11 @@ ROSbagの再生、平面検出ノード、RViz2を同時に起動します。
     ros2 launch plane_detector plane_detection.launch.py \
         bag_path:=/path/to/datasets/robocup/storing_try_2 \
         rate:=0.5
+
+    # RViz2も起動
+    ros2 launch plane_detector plane_detection.launch.py \
+        bag_path:=/path/to/datasets/robocup/storing_try_2 \
+        use_rviz:=true
 """
 
 import os
@@ -63,6 +70,12 @@ def generate_launch_description():
         description='Use simulation time'
     )
 
+    use_rviz_arg = DeclareLaunchArgument(
+        'use_rviz',
+        default_value='false',
+        description='Launch RViz2 (default: false, OpenCV window is used)'
+    )
+
     rviz_config_arg = DeclareLaunchArgument(
         'rviz_config',
         default_value=default_rviz_config,
@@ -80,6 +93,18 @@ def generate_launch_description():
         'normal_threshold_deg',
         default_value='15.0',
         description='Normal angle threshold for horizontal plane detection (degrees)'
+    )
+
+    min_plane_area_arg = DeclareLaunchArgument(
+        'min_plane_area',
+        default_value='0.05',
+        description='Minimum plane area in m^2 (default: 0.05 = 22cm x 22cm)'
+    )
+
+    show_window_arg = DeclareLaunchArgument(
+        'show_window',
+        default_value='true',
+        description='Show OpenCV visualization window'
     )
 
     # ROSbag再生コマンドの構築
@@ -108,7 +133,7 @@ def generate_launch_description():
         )
     )
 
-    # 平面検出ノード
+    # 平面検出ノード（TIAGo rosbag対応）
     plane_detector_node = Node(
         package='plane_detector',
         executable='plane_detector_node',
@@ -119,7 +144,8 @@ def generate_launch_description():
             'rgb_topic': '/head_front_camera/rgb/image_raw',
             'depth_topic': '/head_front_camera/depth/image_raw',
             'camera_info_topic': '/head_front_camera/rgb/camera_info',
-            'camera_frame': 'head_front_camera_rgb_optical_frame',
+            # TIAGo rosbag対応: 正しいTFフレーム名
+            'camera_frame': 'head_front_camera_depth_optical_frame',
             'base_frame': 'base_footprint',
             'depth_scale': 1000.0,  # mm -> m for TIAGo
             'min_depth': 0.3,
@@ -129,13 +155,14 @@ def generate_launch_description():
             'min_plane_points': 500,
             'normal_threshold_deg': LaunchConfiguration('normal_threshold_deg'),
             'process_rate': LaunchConfiguration('process_rate'),
-            'floor_height_max': 0.15,
-            'table_height_min': 0.40,
-            'table_height_max': 1.20,
+            # 面積ベースのフィルタリング（高さ分類なし）
+            'min_plane_area': LaunchConfiguration('min_plane_area'),
+            'max_planes': 8,
+            'show_window': LaunchConfiguration('show_window'),
         }]
     )
 
-    # RViz2を遅延起動（TFが安定するまで待つ）
+    # RViz2を遅延起動（オプション）
     rviz_node = TimerAction(
         period=2.0,  # 2秒待機
         actions=[
@@ -144,7 +171,8 @@ def generate_launch_description():
                 name='rviz2',
                 output='screen'
             )
-        ]
+        ],
+        condition=IfCondition(LaunchConfiguration('use_rviz'))
     )
 
     return LaunchDescription([
@@ -154,9 +182,12 @@ def generate_launch_description():
         loop_arg,
         start_offset_arg,
         use_sim_time_arg,
+        use_rviz_arg,
         rviz_config_arg,
         process_rate_arg,
         normal_threshold_arg,
+        min_plane_area_arg,
+        show_window_arg,
 
         # プロセス
         bag_play_with_loop,
