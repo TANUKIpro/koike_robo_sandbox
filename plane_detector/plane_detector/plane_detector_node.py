@@ -129,6 +129,7 @@ class PlaneDetectorNode(Node):
         self.get_logger().info(f'  Depth topic: {self.depth_topic}')
         self.get_logger().info(f'  Camera frame: {self.camera_frame}')
         self.get_logger().info(f'  Base frame: {self.base_frame}')
+        self.get_logger().info(f'  Show window: {self.show_window}')
 
     def _declare_parameters(self):
         """パラメータの宣言"""
@@ -165,6 +166,9 @@ class PlaneDetectorNode(Node):
         self.declare_parameter('max_planes', 5)
         self.declare_parameter('process_rate', 5.0)  # Hz
 
+        # 表示設定
+        self.declare_parameter('show_window', True)  # OpenCVウィンドウ表示
+
     def _get_parameters(self):
         """パラメータの取得"""
         self.rgb_topic = self.get_parameter('rgb_topic').value
@@ -193,6 +197,8 @@ class PlaneDetectorNode(Node):
 
         self.max_planes = self.get_parameter('max_planes').value
         self.process_rate = self.get_parameter('process_rate').value
+
+        self.show_window = self.get_parameter('show_window').value
 
     def camera_info_callback(self, msg: CameraInfo):
         """CameraInfoを保存"""
@@ -586,6 +592,49 @@ class PlaneDetectorNode(Node):
         overlay_msg.header = header
         self.overlay_pub.publish(overlay_msg)
 
+        # OpenCVウィンドウで表示
+        if self.show_window:
+            self._show_opencv_window(overlay, depth)
+
+    def _show_opencv_window(self, overlay: np.ndarray, depth: np.ndarray):
+        """OpenCVウィンドウで画像を表示"""
+        # RGB -> BGR変換（OpenCV用）
+        overlay_bgr = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
+
+        # 深度画像をカラーマップで表示
+        depth_normalized = np.clip(depth / self.max_depth, 0, 1)
+        depth_colormap = cv2.applyColorMap(
+            (depth_normalized * 255).astype(np.uint8),
+            cv2.COLORMAP_VIRIDIS
+        )
+
+        # 無効な深度は黒に
+        depth_colormap[depth <= 0] = [0, 0, 0]
+
+        # 画像を横に並べて表示
+        h1, w1 = overlay_bgr.shape[:2]
+        h2, w2 = depth_colormap.shape[:2]
+
+        # 高さを揃える
+        if h1 != h2:
+            scale = h1 / h2
+            depth_colormap = cv2.resize(depth_colormap, (int(w2 * scale), h1))
+
+        combined = np.hstack([overlay_bgr, depth_colormap])
+
+        # ウィンドウに表示
+        cv2.imshow('Plane Detection (Q: quit, S: save)', combined)
+
+        # キー入力処理
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q') or key == ord('Q'):
+            self.get_logger().info('Quit requested')
+            rclpy.shutdown()
+        elif key == ord('s') or key == ord('S'):
+            filename = f'plane_detection_{self.frame_count:06d}.png'
+            cv2.imwrite(filename, combined)
+            self.get_logger().info(f'Saved: {filename}')
+
     def _publish_table_surface(self, plane: DetectedPlane, header: Header):
         """テーブル面のPoseStampedを公開"""
         pose_msg = PoseStamped()
@@ -614,6 +663,7 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        cv2.destroyAllWindows()
         node.destroy_node()
         rclpy.shutdown()
 
