@@ -42,23 +42,30 @@ from enum import Enum
 
 
 class PlaneType(Enum):
-    """平面の種類"""
-    UNKNOWN = 0
-    FLOOR = 1
-    TABLE = 2
-    SHELF = 3
+    """平面の種類 - 検出順序で識別"""
+    PLANE_1 = 1  # 最初に検出された平面
+    PLANE_2 = 2  # 2番目に検出された平面
+    PLANE_3 = 3  # 3番目に検出された平面
+    PLANE_4 = 4  # 4番目に検出された平面
+    PLANE_5 = 5  # 5番目に検出された平面
+    PLANE_6 = 6  # 6番目に検出された平面
+    PLANE_7 = 7  # 7番目に検出された平面
+    PLANE_8 = 8  # 8番目に検出された平面
 
 
 @dataclass
 class DetectedPlane:
     """検出された平面の情報"""
     plane_type: PlaneType
+    plane_id: int  # 平面ID（検出順序）
     coefficients: np.ndarray  # [a, b, c, d] where ax + by + cz + d = 0
     inlier_indices: np.ndarray
     center: np.ndarray  # 平面の中心点 (base_footprint座標系)
     height: float  # base_footprintからの高さ
     normal: np.ndarray  # 法線ベクトル (base_footprint座標系)
-    points: np.ndarray  # 平面上の点群
+    points: np.ndarray  # 平面上の点群 (base_footprint座標系)
+    points_camera: np.ndarray  # 平面上の点群 (カメラ座標系)
+    area: float  # 平面の面積 (m^2)
     color: Tuple[float, float, float]  # 可視化色
 
 
@@ -116,13 +123,17 @@ class PlaneDetectorNode(Node):
         )
         self.sync.registerCallback(self.sync_callback)
 
-        # 平面の色定義
-        self.plane_colors = {
-            PlaneType.FLOOR: (0.5, 0.5, 0.5),    # 灰色
-            PlaneType.TABLE: (0.0, 1.0, 0.0),    # 緑色
-            PlaneType.SHELF: (0.0, 0.5, 1.0),    # 青色
-            PlaneType.UNKNOWN: (1.0, 1.0, 0.0),  # 黄色
-        }
+        # 平面の色定義（検出順序で区別しやすい色）
+        self.plane_colors = [
+            (0.0, 1.0, 0.0),    # 緑
+            (0.0, 0.5, 1.0),    # 青
+            (1.0, 0.0, 0.0),    # 赤
+            (1.0, 1.0, 0.0),    # 黄
+            (1.0, 0.0, 1.0),    # マゼンタ
+            (0.0, 1.0, 1.0),    # シアン
+            (1.0, 0.5, 0.0),    # オレンジ
+            (0.5, 0.0, 1.0),    # 紫
+        ]
 
         self.get_logger().info('Plane Detector Node started')
         self.get_logger().info(f'  RGB topic: {self.rgb_topic}')
@@ -138,14 +149,14 @@ class PlaneDetectorNode(Node):
         self.declare_parameter('depth_topic', '/head_front_camera/depth/image_raw')
         self.declare_parameter('camera_info_topic', '/head_front_camera/rgb/camera_info')
 
-        # 座標系設定
-        self.declare_parameter('camera_frame', 'head_front_camera_rgb_optical_frame')
+        # 座標系設定（TIAGo rosbag対応: head_front_camera_depth_optical_frame）
+        self.declare_parameter('camera_frame', 'head_front_camera_depth_optical_frame')
         self.declare_parameter('base_frame', 'base_footprint')
 
         # 深度処理設定
         self.declare_parameter('depth_scale', 1000.0)  # mm -> m
-        self.declare_parameter('min_depth', 0.3)
-        self.declare_parameter('max_depth', 5.0)
+        self.declare_parameter('min_depth', 0.1)  # 最小深度 0.1m（ほぼ制限なし）
+        self.declare_parameter('max_depth', 10.0)  # 最大深度 10m（ほぼ制限なし）
         self.declare_parameter('downsample_factor', 4)
 
         # RANSAC設定
@@ -154,16 +165,15 @@ class PlaneDetectorNode(Node):
         self.declare_parameter('num_iterations', 1000)
         self.declare_parameter('min_plane_points', 500)
 
-        # 法線角度制約
+        # 法線角度制約（水平平面検出用）
         self.declare_parameter('normal_threshold_deg', 15.0)
 
-        # 高さによる分類
-        self.declare_parameter('floor_height_max', 0.15)
-        self.declare_parameter('table_height_min', 0.40)
-        self.declare_parameter('table_height_max', 1.20)
+        # 面積ベースのフィルタリング（m^2）
+        # 一定以上の面積を持つ平面のみを検出・描画
+        self.declare_parameter('min_plane_area', 0.05)  # 最小面積 0.05m^2 (約22cm x 22cm)
 
         # 処理設定
-        self.declare_parameter('max_planes', 5)
+        self.declare_parameter('max_planes', 8)  # より多くの平面を検出
         self.declare_parameter('process_rate', 5.0)  # Hz
 
         # 表示設定
@@ -191,9 +201,7 @@ class PlaneDetectorNode(Node):
         self.normal_threshold_deg = self.get_parameter('normal_threshold_deg').value
         self.normal_threshold_rad = np.deg2rad(self.normal_threshold_deg)
 
-        self.floor_height_max = self.get_parameter('floor_height_max').value
-        self.table_height_min = self.get_parameter('table_height_min').value
-        self.table_height_max = self.get_parameter('table_height_max').value
+        self.min_plane_area = self.get_parameter('min_plane_area').value
 
         self.max_planes = self.get_parameter('max_planes').value
         self.process_rate = self.get_parameter('process_rate').value
@@ -226,37 +234,42 @@ class PlaneDetectorNode(Node):
             if depth is None:
                 return
 
+            # 平面検出を試みる（失敗しても画像は表示）
+            detected_planes = []
+
             # TF取得
             transform = self._get_transform(rgb_msg.header.stamp)
-            if transform is None:
-                return
+            if transform is not None:
+                # 点群生成
+                points_camera = self._create_pointcloud(depth)
+                if len(points_camera) >= self.min_plane_points:
+                    # 点群をbase_footprint座標系に変換
+                    points_base = self._transform_points(points_camera, transform)
 
-            # 点群生成
-            points_camera = self._create_pointcloud(depth)
-            if len(points_camera) < self.min_plane_points:
-                self.get_logger().warn('Not enough points in point cloud',
-                                       throttle_duration_sec=2.0)
-                return
+                    # 重力方向の取得（base_footprint座標系ではZ軸が上向き）
+                    gravity_direction = np.array([0.0, 0.0, 1.0])
 
-            # 点群をbase_footprint座標系に変換
-            points_base = self._transform_points(points_camera, transform)
+                    # 平面検出（面積ベースで全ての水平平面を検出）
+                    detected_planes = self._detect_planes(
+                        points_camera, points_base, gravity_direction)
+                else:
+                    self.get_logger().debug('Not enough points in point cloud',
+                                           throttle_duration_sec=2.0)
 
-            # 重力方向の取得（base_footprint座標系ではZ軸が上向き）
-            gravity_direction = np.array([0.0, 0.0, 1.0])
-
-            # 平面検出
-            detected_planes = self._detect_planes(
-                points_camera, points_base, gravity_direction, rgb)
-
-            # 可視化
+            # 可視化（平面が検出されなくても画像は表示）
             self._publish_markers(detected_planes, rgb_msg.header)
             self._publish_overlay(rgb, depth, detected_planes, rgb_msg.header)
 
-            # テーブル面があれば公開
+            # 最も大きい平面（床以外で一番面積が大きい）をテーブル候補として公開
+            # 床より高い位置にある最大の平面を選択
+            table_candidate = None
+            max_area = 0.0
             for plane in detected_planes:
-                if plane.plane_type == PlaneType.TABLE:
-                    self._publish_table_surface(plane, rgb_msg.header)
-                    break
+                if plane.height > 0.3 and plane.area > max_area:  # 30cm以上の高さ
+                    max_area = plane.area
+                    table_candidate = plane
+            if table_candidate is not None:
+                self._publish_table_surface(table_candidate, rgb_msg.header)
 
         except Exception as e:
             self.get_logger().error(f'Error processing frame: {e}')
@@ -281,18 +294,39 @@ class PlaneDetectorNode(Node):
             return None
 
     def _get_transform(self, stamp) -> Optional[np.ndarray]:
-        """カメラ座標系からbase_footprint座標系への変換を取得"""
+        """カメラ座標系からbase_footprint座標系への変換を取得
+
+        rosbag再生時はTFのタイミングにズレが生じやすいため、
+        以下の順序で取得を試みる：
+        1. 画像のタイムスタンプでTFを取得
+        2. 失敗した場合、最新のTF (Time(0)) を取得
+        3. それも失敗した場合、キャッシュされたTFを使用
+        """
+        # まず画像のタイムスタンプでTFを取得
         try:
             transform = self.tf_buffer.lookup_transform(
                 self.base_frame,
                 self.camera_frame,
                 stamp,
+                timeout=rclpy.duration.Duration(seconds=0.1)  # 短めのタイムアウト
+            )
+            self.latest_transform = transform
+            return self._transform_to_matrix(transform)
+        except TransformException:
+            pass  # 次の方法を試す
+
+        # タイムスタンプでの取得に失敗した場合、最新のTFを取得
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                self.base_frame,
+                self.camera_frame,
+                rclpy.time.Time(),  # Time(0) = 最新のTF
                 timeout=rclpy.duration.Duration(seconds=0.5)
             )
             self.latest_transform = transform
             return self._transform_to_matrix(transform)
         except TransformException as e:
-            # 最新のTFが利用できない場合、キャッシュを使用
+            # 最新のTFも取得できない場合、キャッシュを使用
             if self.latest_transform is not None:
                 return self._transform_to_matrix(self.latest_transform)
             self.get_logger().warn(f'TF not available: {e}', throttle_duration_sec=2.0)
@@ -363,8 +397,8 @@ class PlaneDetectorNode(Node):
         return points_transformed[:, :3]
 
     def _detect_planes(self, points_camera: np.ndarray, points_base: np.ndarray,
-                       gravity_direction: np.ndarray, rgb: np.ndarray) -> List[DetectedPlane]:
-        """RANSAC + 法線制約で水平平面を検出"""
+                       gravity_direction: np.ndarray) -> List[DetectedPlane]:
+        """RANSAC + 法線制約で水平平面を検出（面積ベースでフィルタリング）"""
         detected_planes = []
 
         # Open3D点群に変換
@@ -372,6 +406,7 @@ class PlaneDetectorNode(Node):
         pcd.points = o3d.utility.Vector3dVector(points_base)
 
         remaining_indices = np.arange(len(points_base))
+        plane_count = 0
 
         for i in range(self.max_planes):
             if len(remaining_indices) < self.min_plane_points:
@@ -405,55 +440,89 @@ class PlaneDetectorNode(Node):
             # 重力方向との角度をチェック
             angle = np.arccos(np.clip(np.dot(normal, gravity_direction), -1.0, 1.0))
 
+            # 水平平面のみ採用（法線角度制約）
             if angle < self.normal_threshold_rad:
-                # 水平平面として採用
+                # 平面上の点群を取得
                 actual_indices = remaining_indices[inliers]
-                plane_points = points_base[actual_indices]
+                plane_points_base = points_base[actual_indices]
+                plane_points_camera = points_camera[actual_indices]
 
-                # 平面の中心と高さ
-                center = np.mean(plane_points, axis=0)
-                height = center[2]
+                # 平面の面積を計算（2D凸包）
+                area = self._calculate_plane_area(plane_points_base)
 
-                # 平面タイプの分類
-                plane_type = self._classify_plane(height)
+                # 面積が閾値以上の場合のみ採用
+                if area >= self.min_plane_area:
+                    plane_count += 1
 
-                # 色の取得
-                color = self.plane_colors[plane_type]
+                    # 平面の中心と高さ
+                    center = np.mean(plane_points_base, axis=0)
+                    height = center[2]
 
-                detected_plane = DetectedPlane(
-                    plane_type=plane_type,
-                    coefficients=plane_model,
-                    inlier_indices=actual_indices,
-                    center=center,
-                    height=height,
-                    normal=normal,
-                    points=plane_points,
-                    color=color
-                )
-                detected_planes.append(detected_plane)
+                    # 平面タイプ（検出順序で決定）
+                    plane_type = self._get_plane_type(plane_count)
 
-                self.get_logger().info(
-                    f'Detected {plane_type.name}: height={height:.2f}m, '
-                    f'points={len(inliers)}, angle={np.rad2deg(angle):.1f}deg'
-                )
+                    # 色の取得（検出順序で決定）
+                    color = self.plane_colors[(plane_count - 1) % len(self.plane_colors)]
 
-            # 検出した平面の点を除去
+                    detected_plane = DetectedPlane(
+                        plane_type=plane_type,
+                        plane_id=plane_count,
+                        coefficients=plane_model,
+                        inlier_indices=actual_indices,
+                        center=center,
+                        height=height,
+                        normal=normal,
+                        points=plane_points_base,
+                        points_camera=plane_points_camera,
+                        area=area,
+                        color=color
+                    )
+                    detected_planes.append(detected_plane)
+
+                    self.get_logger().info(
+                        f'Detected Plane {plane_count}: height={height:.2f}m, '
+                        f'area={area:.3f}m², points={len(inliers)}, '
+                        f'angle={np.rad2deg(angle):.1f}deg'
+                    )
+
+            # 検出した平面の点を除去（採用されなくても除去）
             mask = np.ones(len(remaining_indices), dtype=bool)
             mask[inliers] = False
             remaining_indices = remaining_indices[mask]
 
         return detected_planes
 
-    def _classify_plane(self, height: float) -> PlaneType:
-        """高さに基づいて平面を分類"""
-        if height < self.floor_height_max:
-            return PlaneType.FLOOR
-        elif self.table_height_min <= height <= self.table_height_max:
-            return PlaneType.TABLE
-        elif height > self.table_height_max:
-            return PlaneType.SHELF
-        else:
-            return PlaneType.UNKNOWN
+    def _calculate_plane_area(self, points: np.ndarray) -> float:
+        """平面上の点群から面積を計算（2D凸包を使用）"""
+        if len(points) < 3:
+            return 0.0
+
+        try:
+            # XY平面に投影して2D凸包を計算
+            points_2d = points[:, :2]
+
+            # ConvexHullを使用
+            from scipy.spatial import ConvexHull
+            hull = ConvexHull(points_2d)
+            area = hull.volume  # 2Dの場合、volumeが面積を返す
+
+            return area
+        except Exception:
+            # 凸包が計算できない場合、バウンディングボックスの面積を使用
+            x_range = np.max(points[:, 0]) - np.min(points[:, 0])
+            y_range = np.max(points[:, 1]) - np.min(points[:, 1])
+            return x_range * y_range * 0.5  # おおよその面積
+
+    def _get_plane_type(self, plane_id: int) -> PlaneType:
+        """平面IDに基づいてPlaneTypeを取得"""
+        plane_types = [
+            PlaneType.PLANE_1, PlaneType.PLANE_2, PlaneType.PLANE_3,
+            PlaneType.PLANE_4, PlaneType.PLANE_5, PlaneType.PLANE_6,
+            PlaneType.PLANE_7, PlaneType.PLANE_8
+        ]
+        if plane_id <= len(plane_types):
+            return plane_types[plane_id - 1]
+        return PlaneType.PLANE_1
 
     def _publish_markers(self, planes: List[DetectedPlane], header: Header):
         """検出した平面をMarkerArrayとして公開"""
@@ -524,7 +593,7 @@ class PlaneDetectorNode(Node):
             text_marker.color.b = 1.0
             text_marker.color.a = 1.0
 
-            text_marker.text = f'{plane.plane_type.name}\n{plane.height:.2f}m'
+            text_marker.text = f'Plane{plane.plane_id}\nH={plane.height:.2f}m\nA={plane.area:.2f}m²'
             text_marker.lifetime = rclpy.duration.Duration(seconds=0.5).to_msg()
 
             marker_array.markers.append(text_marker)
@@ -536,7 +605,6 @@ class PlaneDetectorNode(Node):
         """RGB画像に検出した平面をオーバーレイして公開"""
         overlay = rgb.copy()
         h, w = depth.shape
-        ds = self.downsample_factor
 
         # カメラパラメータ
         fx = self.camera_info.k[0]
@@ -545,19 +613,9 @@ class PlaneDetectorNode(Node):
         cy = self.camera_info.k[5]
 
         for plane in planes:
-            # 平面上の点をカメラ座標系に逆変換
-            if self.latest_transform is None:
-                continue
-
-            transform = self._transform_to_matrix(self.latest_transform)
-            inv_transform = np.linalg.inv(transform)
-
-            # base_footprint座標系からカメラ座標系へ
-            points_h = np.hstack([plane.points, np.ones((len(plane.points), 1))])
-            points_camera = (inv_transform @ points_h.T).T[:, :3]
-
+            # カメラ座標系の点群を直接使用（逆変換不要）
             # カメラ座標系から画像座標系へ投影
-            for point in points_camera:
+            for point in plane.points_camera:
                 x, y, z = point
                 if z <= 0:
                     continue
@@ -575,17 +633,17 @@ class PlaneDetectorNode(Node):
                     # 小さな円で描画（点群なので）
                     cv2.circle(overlay, (u, v), 2, color_bgr, -1)
 
-        # ラベルを追加
+        # ラベルを追加（面積情報も表示）
         y_offset = 30
         for i, plane in enumerate(planes):
-            label = f'{plane.plane_type.name}: {plane.height:.2f}m'
+            label = f'Plane{plane.plane_id}: H={plane.height:.2f}m A={plane.area:.2f}m2'
             color_bgr = (
                 int(plane.color[2] * 255),
                 int(plane.color[1] * 255),
                 int(plane.color[0] * 255)
             )
             cv2.putText(overlay, label, (10, y_offset + i * 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, color_bgr, 2)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_bgr, 2)
 
         # ROS2メッセージとして公開
         overlay_msg = self.bridge.cv2_to_imgmsg(overlay, encoding='rgb8')
@@ -629,7 +687,7 @@ class PlaneDetectorNode(Node):
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q') or key == ord('Q'):
             self.get_logger().info('Quit requested')
-            rclpy.shutdown()
+            raise KeyboardInterrupt('Quit from OpenCV window')
         elif key == ord('s') or key == ord('S'):
             filename = f'plane_detection_{self.frame_count:06d}.png'
             cv2.imwrite(filename, combined)
@@ -664,8 +722,14 @@ def main(args=None):
         pass
     finally:
         cv2.destroyAllWindows()
-        node.destroy_node()
-        rclpy.shutdown()
+        try:
+            node.destroy_node()
+        except Exception:
+            pass
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass  # 既にシャットダウン済みの場合は無視
 
 
 if __name__ == '__main__':
