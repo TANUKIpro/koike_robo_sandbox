@@ -77,8 +77,8 @@ def parse_args():
         help=f'Depth image topic (default: {TIAGO_DEPTH_TOPIC})'
     )
     parser.add_argument(
-        '--max-frames', type=int, default=100,
-        help='Maximum frames to load from dataset/rosbag (default: 100)'
+        '--max-frames', type=int, default=0,
+        help='Maximum frames to load (0=unlimited, uses lazy loading for rosbag)'
     )
     parser.add_argument(
         '--skip-frames', type=int, default=0,
@@ -122,21 +122,24 @@ def main():
 
     # Load initial data
     if args.rosbag:
-        # Load rosbag
-        print(f"Loading rosbag from: {args.rosbag}")
+        # Load rosbag with lazy loading
+        print(f"Indexing rosbag: {args.rosbag}")
         count = app.image_loader.load_rosbag_sequence(
             args.rosbag,
             rgb_topic=args.rgb_topic,
             depth_topic=args.depth_topic,
             max_frames=args.max_frames,
-            skip_frames=args.skip_frames
+            skip_frames=args.skip_frames,
+            lazy=True  # Use lazy loading
         )
         if count > 0:
             app._update_frame_slider()
+            print(f"Loading first frame...")
             frame = app.image_loader.get_frame(0)
             if frame:
                 app._set_current_frame(frame)
-            app.status_var.set(f"Loaded {count} frames from rosbag")
+            mode = "lazy" if app.image_loader.is_lazy_mode else "memory"
+            app.status_var.set(f"Indexed {count} frames ({mode} loading)")
         else:
             print("Warning: Failed to load rosbag. Check that:")
             print("  1. The path is correct and contains rosbag data")

@@ -200,9 +200,35 @@ class MainWindow:
         right_frame = ttk.Frame(paned)
         paned.add(right_frame, weight=1)
 
-        # Image canvas
+        # Image canvas (expandable)
         self.image_canvas = ImageCanvas(right_frame, width=640, height=480)
         self.image_canvas.pack(fill='both', expand=True)
+
+        # Frame control bar (directly below image canvas)
+        frame_bar = ttk.Frame(right_frame)
+        frame_bar.pack(fill='x', pady=(5, 0))
+
+        # Previous button
+        self.prev_btn = ttk.Button(frame_bar, text="<", width=3, command=self._prev_frame)
+        self.prev_btn.pack(side='left', padx=2)
+
+        # Frame slider
+        self.frame_slider_var = tk.IntVar(value=0)
+        self.frame_slider = ttk.Scale(
+            frame_bar, from_=0, to=0,
+            variable=self.frame_slider_var,
+            orient='horizontal',
+            command=self._on_frame_slider
+        )
+        self.frame_slider.pack(side='left', fill='x', expand=True, padx=5)
+
+        # Next button
+        self.next_btn = ttk.Button(frame_bar, text=">", width=3, command=self._next_frame)
+        self.next_btn.pack(side='left', padx=2)
+
+        # Frame label
+        self.frame_label = ttk.Label(frame_bar, text="Frame: 0/0", width=15)
+        self.frame_label.pack(side='left', padx=10)
 
         # Bottom: Plane info and controls
         bottom_frame = ttk.Frame(right_frame)
@@ -212,26 +238,11 @@ class MainWindow:
         self.plane_info = PlaneInfoPanel(bottom_frame)
         self.plane_info.pack(side='left', fill='both', expand=True, padx=5)
 
-        # Control buttons
+        # Control buttons (detection only)
         ctrl_frame = ttk.Frame(bottom_frame)
         ctrl_frame.pack(side='right', fill='y', padx=5)
 
         ttk.Button(ctrl_frame, text="Run Detection", command=self._run_detection).pack(pady=2, fill='x')
-        ttk.Button(ctrl_frame, text="Previous Frame", command=self._prev_frame).pack(pady=2, fill='x')
-        ttk.Button(ctrl_frame, text="Next Frame", command=self._next_frame).pack(pady=2, fill='x')
-
-        # Frame slider (for sequences)
-        self.frame_slider_var = tk.IntVar(value=0)
-        self.frame_slider = ttk.Scale(
-            ctrl_frame, from_=0, to=0,
-            variable=self.frame_slider_var,
-            orient='horizontal',
-            command=self._on_frame_slider
-        )
-        self.frame_slider.pack(pady=5, fill='x')
-
-        self.frame_label = ttk.Label(ctrl_frame, text="Frame: 0/0")
-        self.frame_label.pack(pady=2)
 
         # Status bar
         self.status_var = tk.StringVar(value="Ready")
@@ -365,7 +376,7 @@ class MainWindow:
         if dialog.result:
             max_frames, skip_frames = dialog.result
 
-            self.status_var.set("Loading RoboCup rosbag...")
+            self.status_var.set("Indexing RoboCup rosbag (lazy loading)...")
             self.root.update()
 
             count = self.image_loader.load_robocup_rosbag(
@@ -373,10 +384,13 @@ class MainWindow:
             )
             if count > 0:
                 self._update_frame_slider()
+                self.status_var.set(f"Loading frame 1/{count}...")
+                self.root.update()
                 frame = self.image_loader.get_frame(0)
                 if frame:
                     self._set_current_frame(frame)
-                self.status_var.set(f"Loaded {count} frames from RoboCup rosbag")
+                mode = "lazy" if self.image_loader.is_lazy_mode else "memory"
+                self.status_var.set(f"Indexed {count} frames ({mode} loading)")
             else:
                 messagebox.showerror(
                     "Error",
@@ -556,21 +570,30 @@ class MainWindow:
 
     def _prev_frame(self):
         """Go to previous frame."""
-        frame = self.image_loader.prev_frame()
-        if frame:
-            self._set_current_frame(frame)
-            self._update_frame_label()
+        self._load_frame_at(self.image_loader._current_index - 1)
 
     def _next_frame(self):
         """Go to next frame."""
-        frame = self.image_loader.next_frame()
-        if frame:
-            self._set_current_frame(frame)
-            self._update_frame_label()
+        self._load_frame_at(self.image_loader._current_index + 1)
 
     def _on_frame_slider(self, value):
         """Handle frame slider change."""
         index = int(float(value))
+        if index != self.image_loader._current_index:
+            self._load_frame_at(index)
+
+    def _load_frame_at(self, index: int):
+        """Load and display frame at given index."""
+        count = self.image_loader.frame_count
+        if index < 0 or index >= count:
+            return
+
+        # Show loading status for lazy loading
+        if self.image_loader.is_lazy_mode:
+            self.status_var.set(f"Loading frame {index + 1}/{count}...")
+            self.frame_label.config(text=f"Loading: {index + 1}/{count}")
+            self.root.update()
+
         frame = self.image_loader.get_frame(index)
         if frame:
             self._set_current_frame(frame)
@@ -581,6 +604,8 @@ class MainWindow:
         count = self.image_loader.frame_count
         if count > 1:
             self.frame_slider.config(to=count - 1)
+        else:
+            self.frame_slider.config(to=0)
         self._update_frame_label()
 
     def _update_frame_label(self):
@@ -650,7 +675,7 @@ class RobocupLoadDialog(tk.Toplevel):
     def __init__(self, parent):
         super().__init__(parent)
         self.title("RoboCup Rosbag Options")
-        self.geometry("350x180")
+        self.geometry("400x200")
         self.transient(parent)
         self.grab_set()
 
@@ -664,23 +689,24 @@ class RobocupLoadDialog(tk.Toplevel):
         # Info label
         info = ttk.Label(
             frame,
-            text="Loading RoboCup TIAGo rosbag\n"
+            text="Loading RoboCup TIAGo rosbag (Lazy Loading)\n"
+                 "Frames are loaded on-demand to save memory.\n"
                  "(Topics: /head_front_camera/rgb/image_raw, depth/image_raw)",
             justify='center'
         )
         info.grid(row=0, column=0, columnspan=2, pady=10)
 
-        # Max frames
-        ttk.Label(frame, text="Max Frames:").grid(row=1, column=0, sticky='w', pady=5)
-        self.max_frames_var = tk.IntVar(value=100)
-        ttk.Spinbox(frame, textvariable=self.max_frames_var, from_=1, to=2000, width=10).grid(
+        # Max frames (0 = unlimited)
+        ttk.Label(frame, text="Max Frames (0=all):").grid(row=1, column=0, sticky='w', pady=5)
+        self.max_frames_var = tk.IntVar(value=0)
+        ttk.Spinbox(frame, textvariable=self.max_frames_var, from_=0, to=10000, width=10).grid(
             row=1, column=1, sticky='w', pady=5
         )
 
         # Skip frames
         ttk.Label(frame, text="Skip First N Frames:").grid(row=2, column=0, sticky='w', pady=5)
         self.skip_frames_var = tk.IntVar(value=0)
-        ttk.Spinbox(frame, textvariable=self.skip_frames_var, from_=0, to=1000, width=10).grid(
+        ttk.Spinbox(frame, textvariable=self.skip_frames_var, from_=0, to=5000, width=10).grid(
             row=2, column=1, sticky='w', pady=5
         )
 

@@ -95,6 +95,15 @@ class CameraIntrinsics:
         )
 
 
+@dataclass
+class FrameIndex:
+    """Index entry for lazy-loaded frame."""
+    rgb_timestamp: int      # RGB timestamp (nanoseconds)
+    depth_timestamp: int    # Depth timestamp (nanoseconds)
+    rgb_path: str = ""      # File path (for TUM) or empty for rosbag
+    depth_path: str = ""    # File path (for TUM) or empty for rosbag
+
+
 class ImageLoader:
     """Load RGB-D images from various sources."""
 
@@ -102,6 +111,15 @@ class ImageLoader:
         self.intrinsics = intrinsics or CameraIntrinsics()
         self._frames: List[RGBDFrame] = []
         self._current_index = 0
+
+        # Lazy loading support for rosbag
+        self._lazy_mode = False
+        self._rosbag_path: Optional[str] = None
+        self._rgb_topic: str = ""
+        self._depth_topic: str = ""
+        self._frame_indices: List[FrameIndex] = []
+        self._frame_cache: Dict[int, RGBDFrame] = {}  # LRU cache
+        self._cache_size = 10  # Keep 10 frames in cache
 
     def load_image_pair(self, rgb_path: str, depth_path: str,
                         depth_scale: Optional[float] = None) -> Optional[RGBDFrame]:
@@ -297,33 +315,356 @@ class ImageLoader:
         rgb_topic: str = TIAGO_RGB_TOPIC,
         depth_topic: str = TIAGO_DEPTH_TOPIC,
         camera_info_topic: str = TIAGO_CAMERA_INFO_TOPIC,
-        max_frames: int = 100,
-        skip_frames: int = 0
+        max_frames: int = 0,  # 0 = unlimited
+        skip_frames: int = 0,
+        lazy: bool = True
     ) -> int:
         """
         Load multiple frames from ROS2 rosbag.
 
         Uses rosbags library (no ROS2 installation required).
+        With lazy=True (default), only indexes frames and loads on demand.
 
         Args:
             bag_path: Path to rosbag directory or file
             rgb_topic: RGB image topic name
             depth_topic: Depth image topic name
             camera_info_topic: Camera info topic name
-            max_frames: Maximum frames to load
+            max_frames: Maximum frames to load (0 = unlimited)
             skip_frames: Skip first N frames
+            lazy: If True, use lazy loading (recommended for large bags)
 
         Returns:
-            Number of frames loaded
+            Number of frames available
         """
         try:
-            return self._load_rosbag_sequence_rosbags(
-                bag_path, rgb_topic, depth_topic, camera_info_topic, max_frames, skip_frames
-            )
+            if lazy:
+                return self._index_rosbag_frames(
+                    bag_path, rgb_topic, depth_topic, camera_info_topic, max_frames, skip_frames
+                )
+            else:
+                return self._load_rosbag_sequence_rosbags(
+                    bag_path, rgb_topic, depth_topic, camera_info_topic, max_frames, skip_frames
+                )
         except ImportError as e:
             print(f"rosbags library not available: {e}")
             print("Install with: pip install rosbags")
             return 0
+
+    def _index_rosbag_frames(
+        self,
+        bag_path: str,
+        rgb_topic: str,
+        depth_topic: str,
+        camera_info_topic: str,
+        max_frames: int,
+        skip_frames: int
+    ) -> int:
+        """Index rosbag frames for lazy loading (no image data loaded)."""
+        # Try new API first
+        try:
+            return self._index_rosbag_new_api(
+                bag_path, rgb_topic, depth_topic, camera_info_topic, max_frames, skip_frames
+            )
+        except ImportError:
+            return self._index_rosbag_old_api(
+                bag_path, rgb_topic, depth_topic, camera_info_topic, max_frames, skip_frames
+            )
+
+    def _index_rosbag_new_api(
+        self,
+        bag_path: str,
+        rgb_topic: str,
+        depth_topic: str,
+        camera_info_topic: str,
+        max_frames: int,
+        skip_frames: int
+    ) -> int:
+        """Index rosbag frames using new rosbags API (>= 0.10)."""
+        from rosbags.highlevel import AnyReader
+        from rosbags.typesys import Stores, get_typestore
+
+        bag_path_obj = Path(bag_path)
+
+        try:
+            typestore = get_typestore(Stores.ROS2_HUMBLE)
+        except AttributeError:
+            typestore = get_typestore(Stores.ROS2_FOXY)
+
+        # Collect timestamps only (not image data)
+        rgb_timestamps: List[int] = []
+        depth_timestamps: List[int] = []
+
+        print(f"Indexing rosbag: {bag_path_obj}")
+
+        with AnyReader([bag_path_obj], default_typestore=typestore) as reader:
+            print("Available topics:")
+            for conn in reader.connections:
+                print(f"  {conn.topic}: {conn.msgtype}")
+
+            for connection, timestamp, rawdata in reader.messages():
+                topic = connection.topic
+
+                if topic == camera_info_topic and self.intrinsics.fx == 525.0:
+                    # Load camera info once
+                    msg = reader.deserialize(rawdata, connection.msgtype)
+                    camera_info = {
+                        'k': list(msg.k),
+                        'width': msg.width,
+                        'height': msg.height
+                    }
+                    self.intrinsics = CameraIntrinsics.from_camera_info(camera_info)
+                    print(f"Camera intrinsics: fx={self.intrinsics.fx:.1f}, fy={self.intrinsics.fy:.1f}")
+
+                elif topic == rgb_topic:
+                    rgb_timestamps.append(timestamp)
+
+                elif topic == depth_topic:
+                    depth_timestamps.append(timestamp)
+
+        return self._build_frame_index(
+            bag_path, rgb_topic, depth_topic,
+            rgb_timestamps, depth_timestamps, max_frames, skip_frames
+        )
+
+    def _index_rosbag_old_api(
+        self,
+        bag_path: str,
+        rgb_topic: str,
+        depth_topic: str,
+        camera_info_topic: str,
+        max_frames: int,
+        skip_frames: int
+    ) -> int:
+        """Index rosbag frames using old rosbags API (< 0.10)."""
+        from rosbags.rosbag2 import Reader
+        from rosbags.serde import deserialize_cdr
+
+        bag_path_obj = Path(bag_path)
+
+        rgb_timestamps: List[int] = []
+        depth_timestamps: List[int] = []
+
+        print(f"Indexing rosbag: {bag_path_obj}")
+
+        with Reader(bag_path_obj) as reader:
+            print("Available topics:")
+            for conn in reader.connections:
+                print(f"  {conn.topic}: {conn.msgtype}")
+
+            for connection, timestamp, rawdata in reader.messages():
+                topic = connection.topic
+
+                if topic == camera_info_topic and self.intrinsics.fx == 525.0:
+                    msg = deserialize_cdr(rawdata, connection.msgtype)
+                    camera_info = {
+                        'k': list(msg.k),
+                        'width': msg.width,
+                        'height': msg.height
+                    }
+                    self.intrinsics = CameraIntrinsics.from_camera_info(camera_info)
+                    print(f"Camera intrinsics: fx={self.intrinsics.fx:.1f}, fy={self.intrinsics.fy:.1f}")
+
+                elif topic == rgb_topic:
+                    rgb_timestamps.append(timestamp)
+
+                elif topic == depth_topic:
+                    depth_timestamps.append(timestamp)
+
+        return self._build_frame_index(
+            bag_path, rgb_topic, depth_topic,
+            rgb_timestamps, depth_timestamps, max_frames, skip_frames
+        )
+
+    def _build_frame_index(
+        self,
+        bag_path: str,
+        rgb_topic: str,
+        depth_topic: str,
+        rgb_timestamps: List[int],
+        depth_timestamps: List[int],
+        max_frames: int,
+        skip_frames: int
+    ) -> int:
+        """Build frame index from timestamps."""
+        print(f"Found {len(rgb_timestamps)} RGB and {len(depth_timestamps)} depth messages")
+
+        # Store rosbag info for lazy loading
+        self._lazy_mode = True
+        self._rosbag_path = bag_path
+        self._rgb_topic = rgb_topic
+        self._depth_topic = depth_topic
+        self._frame_indices = []
+        self._frame_cache = {}
+        self._frames = []
+
+        # Sort timestamps
+        rgb_timestamps = sorted(rgb_timestamps)
+        depth_timestamps_set = set(depth_timestamps)
+        depth_timestamps_sorted = sorted(depth_timestamps)
+
+        frame_count = 0
+        for rgb_ts in rgb_timestamps:
+            if frame_count < skip_frames:
+                frame_count += 1
+                continue
+
+            if max_frames > 0 and len(self._frame_indices) >= max_frames:
+                break
+
+            # Find closest depth timestamp
+            best_depth_ts = None
+            best_diff = float('inf')
+            for depth_ts in depth_timestamps_sorted:
+                diff = abs(rgb_ts - depth_ts)
+                if diff < best_diff:
+                    best_diff = diff
+                    best_depth_ts = depth_ts
+                # Early exit if timestamps diverge
+                if depth_ts > rgb_ts + 100_000_000:
+                    break
+
+            # Allow up to 100ms difference
+            if best_depth_ts is None or best_diff > 100_000_000:
+                frame_count += 1
+                continue
+
+            self._frame_indices.append(FrameIndex(
+                rgb_timestamp=rgb_ts,
+                depth_timestamp=best_depth_ts
+            ))
+            frame_count += 1
+
+        self._current_index = 0
+        print(f"Indexed {len(self._frame_indices)} RGB-D frame pairs (lazy loading enabled)")
+        return len(self._frame_indices)
+
+    def _load_frame_from_rosbag(self, index: int) -> Optional[RGBDFrame]:
+        """Load a single frame from rosbag by index (lazy loading)."""
+        if not self._lazy_mode or not self._rosbag_path:
+            return None
+
+        if index < 0 or index >= len(self._frame_indices):
+            return None
+
+        # Check cache first
+        if index in self._frame_cache:
+            return self._frame_cache[index]
+
+        frame_idx = self._frame_indices[index]
+
+        # Try to load the specific frame
+        try:
+            frame = self._load_single_rosbag_frame(
+                frame_idx.rgb_timestamp,
+                frame_idx.depth_timestamp
+            )
+        except ImportError:
+            return None
+
+        if frame:
+            # Update cache (simple LRU-like behavior)
+            self._frame_cache[index] = frame
+            if len(self._frame_cache) > self._cache_size:
+                # Remove oldest entry
+                oldest_key = next(iter(self._frame_cache))
+                del self._frame_cache[oldest_key]
+
+        return frame
+
+    def _load_single_rosbag_frame(self, rgb_ts: int, depth_ts: int) -> Optional[RGBDFrame]:
+        """Load a single frame from rosbag by timestamp."""
+        try:
+            from rosbags.highlevel import AnyReader
+            from rosbags.typesys import Stores, get_typestore
+            return self._load_single_frame_new_api(rgb_ts, depth_ts)
+        except ImportError:
+            return self._load_single_frame_old_api(rgb_ts, depth_ts)
+
+    def _load_single_frame_new_api(self, rgb_ts: int, depth_ts: int) -> Optional[RGBDFrame]:
+        """Load single frame using new rosbags API."""
+        from rosbags.highlevel import AnyReader
+        from rosbags.typesys import Stores, get_typestore
+
+        bag_path = Path(self._rosbag_path)
+
+        try:
+            typestore = get_typestore(Stores.ROS2_HUMBLE)
+        except AttributeError:
+            typestore = get_typestore(Stores.ROS2_FOXY)
+
+        rgb_msg = None
+        depth_msg = None
+
+        with AnyReader([bag_path], default_typestore=typestore) as reader:
+            for connection, timestamp, rawdata in reader.messages():
+                topic = connection.topic
+
+                if topic == self._rgb_topic and timestamp == rgb_ts:
+                    rgb_msg = reader.deserialize(rawdata, connection.msgtype)
+
+                elif topic == self._depth_topic and timestamp == depth_ts:
+                    depth_msg = reader.deserialize(rawdata, connection.msgtype)
+
+                if rgb_msg and depth_msg:
+                    break
+
+        if not rgb_msg or not depth_msg:
+            return None
+
+        rgb = self._convert_ros_image(rgb_msg)
+        depth = self._convert_ros_depth(depth_msg)
+
+        if rgb is None or depth is None:
+            return None
+
+        return RGBDFrame(
+            rgb=rgb,
+            depth=depth,
+            timestamp=rgb_ts / 1e9,
+            rgb_path=f"rosbag:{rgb_ts}",
+            depth_path=f"rosbag:{depth_ts}"
+        )
+
+    def _load_single_frame_old_api(self, rgb_ts: int, depth_ts: int) -> Optional[RGBDFrame]:
+        """Load single frame using old rosbags API."""
+        from rosbags.rosbag2 import Reader
+        from rosbags.serde import deserialize_cdr
+
+        bag_path = Path(self._rosbag_path)
+
+        rgb_msg = None
+        depth_msg = None
+
+        with Reader(bag_path) as reader:
+            for connection, timestamp, rawdata in reader.messages():
+                topic = connection.topic
+
+                if topic == self._rgb_topic and timestamp == rgb_ts:
+                    rgb_msg = deserialize_cdr(rawdata, connection.msgtype)
+
+                elif topic == self._depth_topic and timestamp == depth_ts:
+                    depth_msg = deserialize_cdr(rawdata, connection.msgtype)
+
+                if rgb_msg and depth_msg:
+                    break
+
+        if not rgb_msg or not depth_msg:
+            return None
+
+        rgb = self._convert_ros_image(rgb_msg)
+        depth = self._convert_ros_depth(depth_msg)
+
+        if rgb is None or depth is None:
+            return None
+
+        return RGBDFrame(
+            rgb=rgb,
+            depth=depth,
+            timestamp=rgb_ts / 1e9,
+            rgb_path=f"rosbag:{rgb_ts}",
+            depth_path=f"rosbag:{depth_ts}"
+        )
 
     def _load_rosbag_sequence_rosbags(
         self,
@@ -574,19 +915,21 @@ class ImageLoader:
     def load_robocup_rosbag(
         self,
         bag_path: str,
-        max_frames: int = 100,
-        skip_frames: int = 0
+        max_frames: int = 0,
+        skip_frames: int = 0,
+        lazy: bool = True
     ) -> int:
         """
         Convenience method to load RoboCup TIAGo rosbag with default topics.
 
         Args:
             bag_path: Path to RoboCup rosbag (e.g., datasets/robocup/storing_try_2)
-            max_frames: Maximum frames to load
+            max_frames: Maximum frames to load (0=unlimited)
             skip_frames: Skip first N frames
+            lazy: Use lazy loading (default True, recommended)
 
         Returns:
-            Number of frames loaded
+            Number of frames available
         """
         # Set TIAGo intrinsics as default
         self.intrinsics = CameraIntrinsics.from_robocup_tiago()
@@ -597,7 +940,8 @@ class ImageLoader:
             depth_topic=TIAGO_DEPTH_TOPIC,
             camera_info_topic=TIAGO_CAMERA_INFO_TOPIC,
             max_frames=max_frames,
-            skip_frames=skip_frames
+            skip_frames=skip_frames,
+            lazy=lazy
         )
 
     def load_rosbag_frame(self, bag_path: str, rgb_topic: str, depth_topic: str,
@@ -617,25 +961,36 @@ class ImageLoader:
 
     @property
     def frame_count(self) -> int:
+        if self._lazy_mode:
+            return len(self._frame_indices)
         return len(self._frames)
 
     @property
     def current_frame(self) -> Optional[RGBDFrame]:
-        if 0 <= self._current_index < len(self._frames):
-            return self._frames[self._current_index]
-        return None
+        return self.get_frame(self._current_index)
 
     def get_frame(self, index: int) -> Optional[RGBDFrame]:
-        if 0 <= index < len(self._frames):
-            self._current_index = index
-            return self._frames[index]
-        return None
+        count = self.frame_count
+        if index < 0 or index >= count:
+            return None
+
+        self._current_index = index
+
+        if self._lazy_mode:
+            return self._load_frame_from_rosbag(index)
+        else:
+            return self._frames[index] if index < len(self._frames) else None
 
     def next_frame(self) -> Optional[RGBDFrame]:
         return self.get_frame(self._current_index + 1)
 
     def prev_frame(self) -> Optional[RGBDFrame]:
         return self.get_frame(self._current_index - 1)
+
+    @property
+    def is_lazy_mode(self) -> bool:
+        """Check if lazy loading is enabled."""
+        return self._lazy_mode
 
 
 def save_frame_pair(frame: RGBDFrame, output_dir: str, prefix: str = "frame"):
