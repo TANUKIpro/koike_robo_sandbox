@@ -30,21 +30,26 @@ python visualize_rgbd.py --dataset tum --path ../datasets/tum_rgbd/rgbd_dataset_
 
 ### 2. visualize_rosbag.py
 
-ROSbag形式のデータセットを可視化します。
+ROSbag形式のデータセットを可視化します。ROS1/ROS2は自動検出されます。
 
 ```bash
 # トピック一覧の確認
-python visualize_rosbag.py --bag ../datasets/voxblox/data.bag --version ros1 --list-topics
+python visualize_rosbag.py --bag ../datasets/voxblox/data.bag --list-topics
 
 # ROS1 bag の可視化（Voxblox, ETH3D, VECtor）
-python visualize_rosbag.py --bag ../datasets/voxblox/data.bag --version ros1 --dataset voxblox
+python visualize_rosbag.py --bag ../datasets/voxblox/data.bag --dataset voxblox
 
 # ROS2 bag の可視化（RoboCup）
-python visualize_rosbag.py --bag ../datasets/robocup/rosbag2_mapping/ --version ros2 --dataset robocup
+python visualize_rosbag.py --bag ../datasets/robocup/rosbag2_mapping/ --dataset robocup
 
 # 点群表示
-python visualize_rosbag.py --bag ../datasets/voxblox/data.bag --version ros1 --mode pointcloud
+python visualize_rosbag.py --bag ../datasets/voxblox/data.bag --mode pointcloud
+
+# トピックを手動指定
+python visualize_rosbag.py --bag data.bag --rgb-topic /camera/rgb/image_raw --depth-topic /camera/depth/image_raw
 ```
+
+**注意**: rosbags 0.10.0 以降の新しいAPIと、それ以前の旧APIの両方に対応しています。
 
 ## 可視化モード
 

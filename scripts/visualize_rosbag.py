@@ -10,13 +10,13 @@ ROS1/ROS2 bag形式のデータセットを読み込み、ロボットの視点�
 
 使用方法:
     # ROS1 bag（ETH3D, VECtor, Voxblox）
-    python visualize_rosbag.py --bag ../datasets/voxblox/data.bag --version ros1
+    python visualize_rosbag.py --bag ../datasets/voxblox/data.bag
 
     # ROS2 bag（RoboCup）
-    python visualize_rosbag.py --bag ../datasets/robocup/rosbag2_mapping/ --version ros2
+    python visualize_rosbag.py --bag ../datasets/robocup/rosbag2_mapping/
 
     # トピック一覧の表示
-    python visualize_rosbag.py --bag ../datasets/voxblox/data.bag --version ros1 --list-topics
+    python visualize_rosbag.py --bag ../datasets/voxblox/data.bag --list-topics
 """
 
 import argparse
@@ -39,14 +39,29 @@ try:
 except ImportError:
     HAS_OPEN3D = False
 
+# rosbags のインポート（新旧両方のAPIに対応）
+HAS_ROSBAGS = False
+ROSBAGS_VERSION = None
+
 try:
-    from rosbags.rosbag1 import Reader as Reader1
-    from rosbags.rosbag2 import Reader as Reader2
-    from rosbags.serde import deserialize_cdr, ros1_to_cdr
+    # 新しいAPI (rosbags >= 0.10.0)
+    from rosbags.highlevel import AnyReader
+    from rosbags.typesys import Stores, get_typestore
     HAS_ROSBAGS = True
+    ROSBAGS_VERSION = "new"
 except ImportError:
-    HAS_ROSBAGS = False
-    print("Error: rosbags package not installed.")
+    try:
+        # 古いAPI (rosbags < 0.10.0)
+        from rosbags.rosbag1 import Reader as Reader1
+        from rosbags.rosbag2 import Reader as Reader2
+        from rosbags.serde import deserialize_cdr, ros1_to_cdr
+        HAS_ROSBAGS = True
+        ROSBAGS_VERSION = "old"
+    except ImportError:
+        pass
+
+if not HAS_ROSBAGS:
+    print("Error: rosbags package not installed or import failed.")
     print("Install with: pip install rosbags")
 
 
@@ -61,20 +76,32 @@ CAMERA_PARAMS = {
 # 各データセットの典型的なトピック名
 TOPIC_PATTERNS = {
     'rgb': ['/camera/color/image_raw', '/d435i/color/image_raw',
-            '/camera/rgb/image_raw', '/rgb/image_raw'],
+            '/camera/rgb/image_raw', '/rgb/image_raw',
+            '/camera/rgb/image_color', '/image_raw'],
     'depth': ['/camera/depth/image_raw', '/d435i/depth/image_rect_raw',
-              '/camera/depth_registered/image_raw', '/depth/image_raw'],
+              '/camera/depth_registered/image_raw', '/depth/image_raw',
+              '/camera/depth/image', '/depth_registered/image_raw'],
     'pointcloud': ['/camera/depth_registered/points', '/points',
                    '/camera/depth/points', '/d435i/depth/points'],
     'imu': ['/imu', '/imu/data', '/d435i/imu', '/ouster/imu'],
 }
 
 
-def list_topics(bag_path: str, version: str) -> None:
-    """ROSbag内のトピック一覧を表示"""
-    if not HAS_ROSBAGS:
-        return
+def list_topics_new_api(bag_path: str) -> None:
+    """ROSbag内のトピック一覧を表示（新API）"""
+    bag_path = Path(bag_path)
 
+    print(f"\nTopics in {bag_path}:")
+    print("-" * 60)
+
+    with AnyReader([bag_path]) as reader:
+        for connection in reader.connections:
+            print(f"  {connection.topic}")
+            print(f"    Type: {connection.msgtype}")
+
+
+def list_topics_old_api(bag_path: str, version: str) -> None:
+    """ROSbag内のトピック一覧を表示（旧API）"""
     Reader = Reader1 if version == 'ros1' else Reader2
 
     print(f"\nTopics in {bag_path}:")
@@ -100,7 +127,7 @@ def find_topic(connections: list, patterns: List[str]) -> Optional[str]:
     return None
 
 
-def read_image_msg(msg, msgtype: str) -> np.ndarray:
+def read_image_msg(msg) -> np.ndarray:
     """sensor_msgs/Image メッセージをNumPy配列に変換"""
     h, w = msg.height, msg.width
     encoding = msg.encoding
@@ -122,13 +149,70 @@ def read_image_msg(msg, msgtype: str) -> np.ndarray:
     return img
 
 
-def read_ros1_bag(bag_path: str, max_frames: int = 100,
-                  rgb_topic: Optional[str] = None,
-                  depth_topic: Optional[str] = None) -> Generator:
-    """ROS1 bagからRGB-Dデータを読み込む"""
-    if not HAS_ROSBAGS:
-        return
+def read_bag_new_api(bag_path: str, max_frames: int = 100,
+                     rgb_topic: Optional[str] = None,
+                     depth_topic: Optional[str] = None) -> Generator:
+    """新しいAnyReader APIでROSbagを読み込む"""
+    bag_path = Path(bag_path)
 
+    with AnyReader([bag_path]) as reader:
+        # トピックの自動検出
+        if rgb_topic is None:
+            rgb_topic = find_topic(reader.connections, TOPIC_PATTERNS['rgb'])
+        if depth_topic is None:
+            depth_topic = find_topic(reader.connections, TOPIC_PATTERNS['depth'])
+
+        print(f"RGB topic: {rgb_topic}")
+        print(f"Depth topic: {depth_topic}")
+
+        if rgb_topic is None and depth_topic is None:
+            print("Warning: No RGB or depth topics found.")
+            return
+
+        rgb_buffer = {}
+        depth_buffer = {}
+        frame_count = 0
+
+        # 対象トピックの接続をフィルタ
+        target_topics = [t for t in [rgb_topic, depth_topic] if t is not None]
+        connections = [c for c in reader.connections if c.topic in target_topics]
+
+        for connection, timestamp, rawdata in reader.messages(connections=connections):
+            if frame_count >= max_frames:
+                break
+
+            try:
+                msg = reader.deserialize(rawdata, connection.msgtype)
+            except Exception as e:
+                print(f"Warning: Failed to deserialize message: {e}")
+                continue
+
+            if connection.topic == rgb_topic:
+                rgb = read_image_msg(msg)
+                rgb_buffer[timestamp] = rgb
+
+            elif connection.topic == depth_topic:
+                depth = read_image_msg(msg)
+                if depth.dtype == np.uint16:
+                    depth = depth.astype(np.float32) / 1000.0
+                depth_buffer[timestamp] = depth
+
+            # マッチング（近いタイムスタンプ）
+            if rgb_buffer and depth_buffer:
+                rgb_ts = max(rgb_buffer.keys())
+                depth_ts = min(depth_buffer.keys(), key=lambda x: abs(x - rgb_ts))
+
+                if abs(rgb_ts - depth_ts) < 50_000_000:  # 50ms
+                    frame_count += 1
+                    yield rgb_buffer[rgb_ts], depth_buffer[depth_ts], rgb_ts
+                    rgb_buffer.clear()
+                    depth_buffer.clear()
+
+
+def read_ros1_bag_old_api(bag_path: str, max_frames: int = 100,
+                          rgb_topic: Optional[str] = None,
+                          depth_topic: Optional[str] = None) -> Generator:
+    """ROS1 bagからRGB-Dデータを読み込む（旧API）"""
     with Reader1(bag_path) as reader:
         # トピックの自動検出
         if rgb_topic is None:
@@ -156,11 +240,11 @@ def read_ros1_bag(bag_path: str, max_frames: int = 100,
                 continue
 
             if connection.topic == rgb_topic:
-                rgb = read_image_msg(msg, connection.msgtype)
+                rgb = read_image_msg(msg)
                 rgb_buffer[timestamp] = rgb
 
             elif connection.topic == depth_topic:
-                depth = read_image_msg(msg, connection.msgtype)
+                depth = read_image_msg(msg)
                 if depth.dtype == np.uint16:
                     depth = depth.astype(np.float32) / 1000.0
                 depth_buffer[timestamp] = depth
@@ -177,13 +261,10 @@ def read_ros1_bag(bag_path: str, max_frames: int = 100,
                     depth_buffer.clear()
 
 
-def read_ros2_bag(bag_path: str, max_frames: int = 100,
-                  rgb_topic: Optional[str] = None,
-                  depth_topic: Optional[str] = None) -> Generator:
-    """ROS2 bagからRGB-Dデータを読み込む"""
-    if not HAS_ROSBAGS:
-        return
-
+def read_ros2_bag_old_api(bag_path: str, max_frames: int = 100,
+                          rgb_topic: Optional[str] = None,
+                          depth_topic: Optional[str] = None) -> Generator:
+    """ROS2 bagからRGB-Dデータを読み込む（旧API）"""
     with Reader2(bag_path) as reader:
         # トピックの自動検出
         if rgb_topic is None:
@@ -208,11 +289,11 @@ def read_ros2_bag(bag_path: str, max_frames: int = 100,
                 continue
 
             if connection.topic == rgb_topic:
-                rgb = read_image_msg(msg, connection.msgtype)
+                rgb = read_image_msg(msg)
                 rgb_buffer[timestamp] = rgb
 
             elif connection.topic == depth_topic:
-                depth = read_image_msg(msg, connection.msgtype)
+                depth = read_image_msg(msg)
                 if depth.dtype == np.uint16:
                     depth = depth.astype(np.float32) / 1000.0
                 depth_buffer[timestamp] = depth
@@ -340,13 +421,24 @@ def interactive_viewer(frames: List[Tuple], camera_params: Dict[str, float]) -> 
 def main():
     parser = argparse.ArgumentParser(
         description='ROSbagからRGB-Dデータを可視化',
-        formatter_class=argparse.RawDescriptionHelpFormatter
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+例:
+    # 基本的な使用方法（ROS1/ROS2自動検出）
+    python visualize_rosbag.py --bag ../datasets/voxblox/data.bag
+
+    # トピック一覧の表示
+    python visualize_rosbag.py --bag ../datasets/voxblox/data.bag --list-topics
+
+    # トピックを手動で指定
+    python visualize_rosbag.py --bag data.bag --rgb-topic /camera/rgb/image_raw --depth-topic /camera/depth/image_raw
+        """
     )
     parser.add_argument('--bag', type=str, required=True,
-                        help='ROSbagファイルのパス')
-    parser.add_argument('--version', type=str, required=True,
+                        help='ROSbagファイルまたはディレクトリのパス')
+    parser.add_argument('--version', type=str, default=None,
                         choices=['ros1', 'ros2'],
-                        help='ROS version (ros1 or ros2)')
+                        help='ROS version (自動検出されるため通常不要)')
     parser.add_argument('--dataset', type=str, default='voxblox',
                         choices=['eth3d', 'vector', 'robocup', 'voxblox'],
                         help='データセットの種類（カメラパラメータ用）')
@@ -371,20 +463,33 @@ def main():
         print("Install with: pip install rosbags")
         sys.exit(1)
 
+    print(f"Using rosbags API: {ROSBAGS_VERSION}")
+
     # トピック一覧表示
     if args.list_topics:
-        list_topics(args.bag, args.version)
+        if ROSBAGS_VERSION == "new":
+            list_topics_new_api(args.bag)
+        else:
+            version = args.version or ('ros1' if args.bag.endswith('.bag') else 'ros2')
+            list_topics_old_api(args.bag, version)
         return
 
     # データ読み込み
-    print(f"Loading {args.version} bag: {args.bag}")
+    print(f"Loading bag: {args.bag}")
 
-    if args.version == 'ros1':
-        reader = read_ros1_bag(args.bag, args.max_frames,
-                               args.rgb_topic, args.depth_topic)
+    if ROSBAGS_VERSION == "new":
+        # 新しいAPI（ROS1/ROS2自動検出）
+        reader = read_bag_new_api(args.bag, args.max_frames,
+                                  args.rgb_topic, args.depth_topic)
     else:
-        reader = read_ros2_bag(args.bag, args.max_frames,
-                               args.rgb_topic, args.depth_topic)
+        # 古いAPI（バージョン指定が必要）
+        version = args.version or ('ros1' if args.bag.endswith('.bag') else 'ros2')
+        if version == 'ros1':
+            reader = read_ros1_bag_old_api(args.bag, args.max_frames,
+                                           args.rgb_topic, args.depth_topic)
+        else:
+            reader = read_ros2_bag_old_api(args.bag, args.max_frames,
+                                           args.rgb_topic, args.depth_topic)
 
     frames = list(reader)
     print(f"Loaded {len(frames)} frames")
