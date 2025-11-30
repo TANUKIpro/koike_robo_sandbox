@@ -335,12 +335,95 @@ class ImageLoader:
         skip_frames: int
     ) -> int:
         """Load rosbag using rosbags library (no ROS2 required)."""
+        from pathlib import Path as RosbagPath
+
+        # Try new API first (rosbags >= 0.10), then fall back to old API
+        try:
+            return self._load_rosbag_new_api(
+                bag_path, rgb_topic, depth_topic, camera_info_topic, max_frames, skip_frames
+            )
+        except ImportError:
+            return self._load_rosbag_old_api(
+                bag_path, rgb_topic, depth_topic, camera_info_topic, max_frames, skip_frames
+            )
+
+    def _load_rosbag_new_api(
+        self,
+        bag_path: str,
+        rgb_topic: str,
+        depth_topic: str,
+        camera_info_topic: str,
+        max_frames: int,
+        skip_frames: int
+    ) -> int:
+        """Load rosbag using new rosbags API (>= 0.10)."""
+        from rosbags.highlevel import AnyReader
+        from rosbags.typesys import Stores, get_typestore
+
+        bag_path = Path(bag_path)
+
+        # Create type store for ROS2 Humble (or Foxy as fallback)
+        try:
+            typestore = get_typestore(Stores.ROS2_HUMBLE)
+        except AttributeError:
+            typestore = get_typestore(Stores.ROS2_FOXY)
+
+        # Collect RGB and depth messages by timestamp (deserialize immediately)
+        rgb_messages: Dict[int, Any] = {}
+        depth_messages: Dict[int, Any] = {}
+        camera_info = None
+
+        print(f"Reading rosbag from: {bag_path}")
+
+        with AnyReader([bag_path], default_typestore=typestore) as reader:
+            # Print available topics
+            print("Available topics:")
+            for conn in reader.connections:
+                print(f"  {conn.topic}: {conn.msgtype}")
+
+            for connection, timestamp, rawdata in reader.messages():
+                topic = connection.topic
+
+                if topic == camera_info_topic and camera_info is None:
+                    msg = reader.deserialize(rawdata, connection.msgtype)
+                    camera_info = {
+                        'k': list(msg.k),
+                        'width': msg.width,
+                        'height': msg.height
+                    }
+                    self.intrinsics = CameraIntrinsics.from_camera_info(camera_info)
+                    print(f"Camera intrinsics loaded: fx={self.intrinsics.fx:.1f}, fy={self.intrinsics.fy:.1f}")
+
+                elif topic == rgb_topic:
+                    # Deserialize immediately within the context
+                    msg = reader.deserialize(rawdata, connection.msgtype)
+                    rgb_messages[timestamp] = msg
+
+                elif topic == depth_topic:
+                    # Deserialize immediately within the context
+                    msg = reader.deserialize(rawdata, connection.msgtype)
+                    depth_messages[timestamp] = msg
+
+        return self._process_deserialized_messages(
+            rgb_messages, depth_messages, max_frames, skip_frames
+        )
+
+    def _load_rosbag_old_api(
+        self,
+        bag_path: str,
+        rgb_topic: str,
+        depth_topic: str,
+        camera_info_topic: str,
+        max_frames: int,
+        skip_frames: int
+    ) -> int:
+        """Load rosbag using old rosbags API (< 0.10)."""
         from rosbags.rosbag2 import Reader
         from rosbags.serde import deserialize_cdr
 
         bag_path = Path(bag_path)
 
-        # Collect RGB and depth messages by timestamp
+        # Collect RGB and depth messages by timestamp (deserialize immediately)
         rgb_messages: Dict[int, Any] = {}
         depth_messages: Dict[int, Any] = {}
         camera_info = None
@@ -367,12 +450,27 @@ class ImageLoader:
                     print(f"Camera intrinsics loaded: fx={self.intrinsics.fx:.1f}, fy={self.intrinsics.fy:.1f}")
 
                 elif topic == rgb_topic:
-                    rgb_messages[timestamp] = (rawdata, connection.msgtype)
+                    # Deserialize immediately
+                    msg = deserialize_cdr(rawdata, connection.msgtype)
+                    rgb_messages[timestamp] = msg
 
                 elif topic == depth_topic:
-                    depth_messages[timestamp] = (rawdata, connection.msgtype)
+                    # Deserialize immediately
+                    msg = deserialize_cdr(rawdata, connection.msgtype)
+                    depth_messages[timestamp] = msg
 
-        # Match RGB and depth by timestamp
+        return self._process_deserialized_messages(
+            rgb_messages, depth_messages, max_frames, skip_frames
+        )
+
+    def _process_deserialized_messages(
+        self,
+        rgb_messages: Dict[int, Any],
+        depth_messages: Dict[int, Any],
+        max_frames: int,
+        skip_frames: int
+    ) -> int:
+        """Process already-deserialized rosbag messages into frames."""
         print(f"Found {len(rgb_messages)} RGB and {len(depth_messages)} depth messages")
 
         self._frames = []
@@ -401,12 +499,9 @@ class ImageLoader:
                 frame_count += 1
                 continue
 
-            # Deserialize messages
-            rgb_raw, rgb_msgtype = rgb_messages[rgb_ts]
-            depth_raw, depth_msgtype = depth_messages[best_depth_ts]
-
-            rgb_msg = deserialize_cdr(rgb_raw, rgb_msgtype)
-            depth_msg = deserialize_cdr(depth_raw, depth_msgtype)
+            # Get already-deserialized messages
+            rgb_msg = rgb_messages[rgb_ts]
+            depth_msg = depth_messages[best_depth_ts]
 
             # Convert RGB
             rgb = self._convert_ros_image(rgb_msg)
