@@ -130,6 +130,8 @@ class PlaneDetectorNode(Node):
         self.get_logger().info(f'  Camera frame: {self.camera_frame}')
         self.get_logger().info(f'  Base frame: {self.base_frame}')
         self.get_logger().info(f'  Show window: {self.show_window}')
+        self.get_logger().info(f'  Min detection height: {self.min_detection_height}m (floor excluded)')
+        self.get_logger().info(f'  Normal threshold: {self.normal_threshold_deg}deg (horizontal only)')
 
     def _declare_parameters(self):
         """パラメータの宣言"""
@@ -154,13 +156,19 @@ class PlaneDetectorNode(Node):
         self.declare_parameter('num_iterations', 1000)
         self.declare_parameter('min_plane_points', 500)
 
-        # 法線角度制約
-        self.declare_parameter('normal_threshold_deg', 15.0)
+        # 法線角度制約（水平平面のみを検出するため厳しく設定）
+        self.declare_parameter('normal_threshold_deg', 10.0)
+
+        # 床の高さ設定（固定値として床を除外）
+        self.declare_parameter('floor_height_fixed', 0.05)  # 床の高さ（これ以下は床として除外）
 
         # 高さによる分類
         self.declare_parameter('floor_height_max', 0.15)
         self.declare_parameter('table_height_min', 0.40)
         self.declare_parameter('table_height_max', 1.20)
+
+        # 検出対象の最小高さ（床より上のみを検出）
+        self.declare_parameter('min_detection_height', 0.20)
 
         # 処理設定
         self.declare_parameter('max_planes', 5)
@@ -191,9 +199,11 @@ class PlaneDetectorNode(Node):
         self.normal_threshold_deg = self.get_parameter('normal_threshold_deg').value
         self.normal_threshold_rad = np.deg2rad(self.normal_threshold_deg)
 
+        self.floor_height_fixed = self.get_parameter('floor_height_fixed').value
         self.floor_height_max = self.get_parameter('floor_height_max').value
         self.table_height_min = self.get_parameter('table_height_min').value
         self.table_height_max = self.get_parameter('table_height_max').value
+        self.min_detection_height = self.get_parameter('min_detection_height').value
 
         self.max_planes = self.get_parameter('max_planes').value
         self.process_rate = self.get_parameter('process_rate').value
@@ -364,21 +374,40 @@ class PlaneDetectorNode(Node):
 
     def _detect_planes(self, points_camera: np.ndarray, points_base: np.ndarray,
                        gravity_direction: np.ndarray, rgb: np.ndarray) -> List[DetectedPlane]:
-        """RANSAC + 法線制約で水平平面を検出"""
+        """RANSAC + 法線制約で水平平面のみを検出（床より上の平面のみ）"""
         detected_planes = []
 
-        # Open3D点群に変換
+        # 床より上の点群のみをフィルタリング
+        height_mask = points_base[:, 2] > self.min_detection_height
+        filtered_indices = np.where(height_mask)[0]
+
+        if len(filtered_indices) < self.min_plane_points:
+            self.get_logger().debug(
+                f'Not enough points above min_detection_height ({self.min_detection_height}m): '
+                f'{len(filtered_indices)} points'
+            )
+            return detected_planes
+
+        # フィルタリングされた点群でOpen3D点群を作成
+        filtered_points = points_base[filtered_indices]
         pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(points_base)
+        pcd.points = o3d.utility.Vector3dVector(filtered_points)
 
-        remaining_indices = np.arange(len(points_base))
+        # フィルタリング後のインデックスを管理
+        remaining_local_indices = np.arange(len(filtered_points))
+        non_horizontal_attempts = 0
+        max_non_horizontal_attempts = 10  # 非水平面を連続で検出した場合の打ち切り回数
 
-        for i in range(self.max_planes):
-            if len(remaining_indices) < self.min_plane_points:
+        for i in range(self.max_planes + max_non_horizontal_attempts):
+            if len(remaining_local_indices) < self.min_plane_points:
+                break
+
+            if non_horizontal_attempts >= max_non_horizontal_attempts:
+                self.get_logger().debug('Too many non-horizontal planes detected, stopping')
                 break
 
             # 現在の点群を抽出
-            current_pcd = pcd.select_by_index(remaining_indices)
+            current_pcd = pcd.select_by_index(remaining_local_indices)
 
             # RANSAC平面検出
             try:
@@ -387,7 +416,8 @@ class PlaneDetectorNode(Node):
                     ransac_n=self.ransac_n,
                     num_iterations=self.num_iterations
                 )
-            except Exception:
+            except Exception as e:
+                self.get_logger().debug(f'RANSAC failed: {e}')
                 break
 
             if len(inliers) < self.min_plane_points:
@@ -402,45 +432,69 @@ class PlaneDetectorNode(Node):
             if normal[2] < 0:
                 normal = -normal
 
-            # 重力方向との角度をチェック
+            # 重力方向との角度をチェック（水平平面のみを採用）
             angle = np.arccos(np.clip(np.dot(normal, gravity_direction), -1.0, 1.0))
 
             if angle < self.normal_threshold_rad:
                 # 水平平面として採用
-                actual_indices = remaining_indices[inliers]
-                plane_points = points_base[actual_indices]
+                local_actual_indices = remaining_local_indices[inliers]
+                global_actual_indices = filtered_indices[local_actual_indices]
+                plane_points = points_base[global_actual_indices]
 
                 # 平面の中心と高さ
                 center = np.mean(plane_points, axis=0)
                 height = center[2]
 
-                # 平面タイプの分類
-                plane_type = self._classify_plane(height)
+                # 床より上の平面のみを採用（二重チェック）
+                if height > self.min_detection_height:
+                    # 平面タイプの分類
+                    plane_type = self._classify_plane(height)
 
-                # 色の取得
-                color = self.plane_colors[plane_type]
+                    # 床として分類されたものは除外
+                    if plane_type != PlaneType.FLOOR:
+                        # 色の取得
+                        color = self.plane_colors[plane_type]
 
-                detected_plane = DetectedPlane(
-                    plane_type=plane_type,
-                    coefficients=plane_model,
-                    inlier_indices=actual_indices,
-                    center=center,
-                    height=height,
-                    normal=normal,
-                    points=plane_points,
-                    color=color
+                        detected_plane = DetectedPlane(
+                            plane_type=plane_type,
+                            coefficients=plane_model,
+                            inlier_indices=global_actual_indices,
+                            center=center,
+                            height=height,
+                            normal=normal,
+                            points=plane_points,
+                            color=color
+                        )
+                        detected_planes.append(detected_plane)
+
+                        self.get_logger().info(
+                            f'Detected {plane_type.name}: height={height:.2f}m, '
+                            f'points={len(inliers)}, angle={np.rad2deg(angle):.1f}deg'
+                        )
+
+                # 水平平面の点を除去（採用・不採用に関わらず）
+                mask = np.ones(len(remaining_local_indices), dtype=bool)
+                mask[inliers] = False
+                remaining_local_indices = remaining_local_indices[mask]
+                non_horizontal_attempts = 0  # リセット
+
+                # 検出した平面数が上限に達したら終了
+                if len(detected_planes) >= self.max_planes:
+                    break
+            else:
+                # 非水平平面は除去せず、カウントのみ増加
+                # ただし、大きな非水平平面の場合は除去して次へ進む
+                self.get_logger().debug(
+                    f'Skipping non-horizontal plane: angle={np.rad2deg(angle):.1f}deg'
                 )
-                detected_planes.append(detected_plane)
 
-                self.get_logger().info(
-                    f'Detected {plane_type.name}: height={height:.2f}m, '
-                    f'points={len(inliers)}, angle={np.rad2deg(angle):.1f}deg'
-                )
+                # 大きな垂直面などが検出された場合は除去して次へ
+                if len(inliers) > self.min_plane_points * 2:
+                    mask = np.ones(len(remaining_local_indices), dtype=bool)
+                    mask[inliers] = False
+                    remaining_local_indices = remaining_local_indices[mask]
 
-            # 検出した平面の点を除去
-            mask = np.ones(len(remaining_indices), dtype=bool)
-            mask[inliers] = False
-            remaining_indices = remaining_indices[mask]
+                non_horizontal_attempts += 1
 
         return detected_planes
 
