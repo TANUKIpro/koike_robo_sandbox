@@ -25,6 +25,7 @@ setup(
     entry_points={
         'console_scripts': [
             'plane_detector_node = plane_detector.plane_detector_node:main',
+            'plane_recorder_node = plane_detector.plane_recorder_node:main',
         ],
     },
 )
