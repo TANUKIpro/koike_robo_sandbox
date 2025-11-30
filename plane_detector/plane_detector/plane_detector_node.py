@@ -294,18 +294,39 @@ class PlaneDetectorNode(Node):
             return None
 
     def _get_transform(self, stamp) -> Optional[np.ndarray]:
-        """カメラ座標系からbase_footprint座標系への変換を取得"""
+        """カメラ座標系からbase_footprint座標系への変換を取得
+
+        rosbag再生時はTFのタイミングにズレが生じやすいため、
+        以下の順序で取得を試みる：
+        1. 画像のタイムスタンプでTFを取得
+        2. 失敗した場合、最新のTF (Time(0)) を取得
+        3. それも失敗した場合、キャッシュされたTFを使用
+        """
+        # まず画像のタイムスタンプでTFを取得
         try:
             transform = self.tf_buffer.lookup_transform(
                 self.base_frame,
                 self.camera_frame,
                 stamp,
+                timeout=rclpy.duration.Duration(seconds=0.1)  # 短めのタイムアウト
+            )
+            self.latest_transform = transform
+            return self._transform_to_matrix(transform)
+        except TransformException:
+            pass  # 次の方法を試す
+
+        # タイムスタンプでの取得に失敗した場合、最新のTFを取得
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                self.base_frame,
+                self.camera_frame,
+                rclpy.time.Time(),  # Time(0) = 最新のTF
                 timeout=rclpy.duration.Duration(seconds=0.5)
             )
             self.latest_transform = transform
             return self._transform_to_matrix(transform)
         except TransformException as e:
-            # 最新のTFが利用できない場合、キャッシュを使用
+            # 最新のTFも取得できない場合、キャッシュを使用
             if self.latest_transform is not None:
                 return self._transform_to_matrix(self.latest_transform)
             self.get_logger().warn(f'TF not available: {e}', throttle_duration_sec=2.0)
@@ -666,7 +687,7 @@ class PlaneDetectorNode(Node):
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q') or key == ord('Q'):
             self.get_logger().info('Quit requested')
-            rclpy.shutdown()
+            raise KeyboardInterrupt('Quit from OpenCV window')
         elif key == ord('s') or key == ord('S'):
             filename = f'plane_detection_{self.frame_count:06d}.png'
             cv2.imwrite(filename, combined)
@@ -701,8 +722,14 @@ def main(args=None):
         pass
     finally:
         cv2.destroyAllWindows()
-        node.destroy_node()
-        rclpy.shutdown()
+        try:
+            node.destroy_node()
+        except Exception:
+            pass
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass  # 既にシャットダウン済みの場合は無視
 
 
 if __name__ == '__main__':
