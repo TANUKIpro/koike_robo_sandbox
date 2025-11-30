@@ -6,6 +6,7 @@
 *.bag
 *.db3
 metadata.yaml
+*.log
 
 # Compressed archives
 *.tgz
