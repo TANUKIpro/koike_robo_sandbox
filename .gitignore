@@ -101,3 +101,7 @@ results/
 
 # gabage
 *:Zone.Identifier
+
+# ros
+install/
+log/
