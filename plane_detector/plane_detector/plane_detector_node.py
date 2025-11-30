@@ -90,11 +90,11 @@ class PlaneDetectorNode(Node):
         self.table_pub = self.create_publisher(
             PoseStamped, '/detected_table_surface', 10)
 
-        # QoS for camera info (latched)
+        # QoS for camera info (compatible with rosbag)
         camera_info_qos = QoSProfile(
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
-            depth=1
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            depth=10
         )
 
         # CameraInfo subscriber
